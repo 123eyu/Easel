@@ -319,6 +319,94 @@ def test_xhs_existing_qr_is_not_toggled_back_to_sms(tmp_path, monkeypatch):
     button.click.assert_not_called()
 
 
+def test_xhs_creator_obfuscated_image_is_captured_after_corner_switch(tmp_path):
+    ready = False
+    clicked = []
+    icon = io.BytesIO()
+    Image.new("RGB", (64, 64), "gray").save(icon, format="PNG")
+
+    def click(**kwargs):
+        nonlocal ready
+        ready = True
+        clicked.append(True)
+
+    switch = qr_element(image=icon.getvalue())
+    switch.click = click
+    page = xhs_page(xhs_publish.CREATOR_LOGIN_URL, body="短信登录")
+
+    def query(selector):
+        if selector == ".sso-login-wrapper img":
+            return [switch, qr_element()] if ready else [switch]
+        if selector in (".sso-login-wrapper > div > div > img", xhs_publish.SELECTORS["qr_switch"]):
+            return [switch]
+        return []
+
+    page.query_selector_all = query
+    assert xhs_publish._capture_login_qr(page, tmp_path / "qr.png")
+    assert clicked == [True]
+    assert (tmp_path / "qr.png").exists()
+    page.goto.assert_not_called()
+    assert any(call.kwargs.get("state") == "hidden"
+               for call in page.wait_for_selector.call_args_list)
+
+
+def test_xhs_creator_existing_obfuscated_qr_does_not_click_icon(tmp_path):
+    page = xhs_page(xhs_publish.CREATOR_LOGIN_URL, body="APP扫一扫登录")
+    button = SimpleNamespace(is_visible=lambda: True, click=Mock())
+    page.query_selector_all = lambda selector: [qr_element()] \
+        if selector == ".sso-login-wrapper img" \
+        else ([button] if selector == xhs_publish.SELECTORS["qr_switch"] else [])
+    assert xhs_publish._capture_login_qr(page, tmp_path / "qr.png")
+    button.click.assert_not_called()
+
+
+def test_xhs_opens_anonymous_home_login_dialog(tmp_path, monkeypatch):
+    page = xhs_page(body="发现")
+    button = SimpleNamespace(is_visible=lambda: True, click=Mock())
+    page.query_selector_all = lambda selector: [button] \
+        if selector == ".side-bar-component.login-btn" else []
+    capture = Mock()
+    monkeypatch.setattr(login_qr, "capture_qr", capture)
+    assert xhs_publish._capture_login_qr(page, tmp_path / "qr.png")
+    button.click.assert_called_once()
+    capture.assert_called_once()
+    page.goto.assert_not_called()
+
+
+def test_xhs_visible_login_panel_never_clicks_submit(tmp_path, monkeypatch):
+    page = xhs_page(xhs_publish.CREATOR_LOGIN_URL, body="短信登录")
+    wall = SimpleNamespace(is_visible=lambda: True)
+    button = SimpleNamespace(is_visible=lambda: True, click=Mock())
+    page.query_selector_all = lambda selector: [wall] \
+        if selector in (xhs_publish.SELECTORS["logged_out"], ".login-container") \
+        else ([button] if selector == ".side-bar-component.login-btn" else [])
+    monkeypatch.setattr(login_qr, "capture_qr", Mock())
+    assert xhs_publish._capture_login_qr(page, tmp_path / "qr.png")
+    button.click.assert_not_called()
+
+
+@pytest.mark.parametrize("body,expected", [
+    ("", "空白"),
+    ("短信登录 发送验证码", "短信登录"),
+    ("APP扫一扫登录", "二维码未加载"),
+])
+def test_xhs_missing_qr_retains_both_entry_diagnostics(tmp_path, monkeypatch, body, expected):
+    page = xhs_page(body=body)
+    monkeypatch.setattr(login_qr, "capture_qr", Mock(side_effect=RuntimeError("missing qr")))
+    with pytest.raises(RuntimeError, match=expected) as error:
+        xhs_publish._capture_login_qr(page, tmp_path / "qr.png")
+    assert "小红书首页" in str(error.value)
+    assert "创作平台" in str(error.value)
+
+
+def test_xhs_home_risk_not_hidden_by_blank_creator(tmp_path, monkeypatch):
+    page = xhs_page("https://www.xiaohongshu.com/website-login/error?error_code=300012")
+    monkeypatch.setattr(login_qr, "capture_qr", Mock(side_effect=RuntimeError("missing qr")))
+    with pytest.raises(RuntimeError, match="300012") as error:
+        xhs_publish._capture_login_qr(page, tmp_path / "qr.png")
+    assert "空白" in str(error.value)
+
+
 def test_xhs_creator_navigation_failure_has_actionable_message(tmp_path, monkeypatch):
     page = xhs_page()
     page.goto.side_effect = TimeoutError("sensitive_url?token=private")
@@ -346,7 +434,7 @@ def test_xhs_headless_risk_falls_back_to_creator_once(tmp_path, monkeypatch):
     monkeypatch.setattr(login_qr, "capture_qr", capture)
     assert xhs_publish._capture_login_qr(page, tmp_path / "qr.png")
     page.goto.assert_called_once_with(xhs_publish.CREATOR_LOGIN_URL,
-                                     wait_until="domcontentloaded", timeout=45000)
+                                     wait_until="commit", timeout=30000)
     capture.assert_called_once()
 
 
