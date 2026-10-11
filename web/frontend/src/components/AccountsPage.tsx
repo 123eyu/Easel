@@ -386,7 +386,7 @@ export default function AccountsPage() {
               <div style={{ fontSize: 48, padding: 40 }}>✅</div>
             ) : ['error', 'expired'].includes(qr.state) ? (
               <div style={{ fontSize: 13, color: 'var(--red)', padding: 30 }}>
-                {qr.message || '登录失败'}<br />可关闭后重试（或换干净 IP）。
+                {qr.message || '登录失败'}<br />请根据上方具体原因排查；可关闭后重试，日志在 outputs/_login/。
               </div>
             ) : (
               <div className="loading" style={{ padding: 40 }}><div className="spinner" />准备二维码…</div>

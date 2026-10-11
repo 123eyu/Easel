@@ -3850,12 +3850,12 @@ def _login_status(platform: str) -> dict:
     # A runner that exits before writing its status must become an actionable error,
     # never the ambiguous ``unknown`` state shown as an endless spinner in the UI.
     proc = LOGIN_PROCESSES.get(platform)
-    if data['state'] in ('unknown', 'starting') and proc is not None:
+    if data['state'] not in ('success', 'expired', 'error') and proc is not None:
         code = proc.poll()
         if code is not None:
             data = {'state': 'error', 'message': f'登录程序异常退出（退出码 {code}），请查看 outputs/_login/{platform}.log'}
     qr = LOGIN_DIR / f'{platform}.png'
-    if qr.is_file():
+    if data['state'] in ('qr_ready', 'window_login') and qr.is_file():
         data['qr'] = f'_login/{platform}.png'
         try:
             data['qrTs'] = int(qr.stat().st_mtime)   # 二维码 mtime 作缓存键：码每刷新一次就变，前端 img 随之刷新
@@ -3891,6 +3891,9 @@ async def api_login_start(platform: str):
         # 公众号不走扫码：前端应改用凭证表单提交到 /api/accounts/{platform}/credentials。
         return {'mode': 'credentials', 'configured': _wechat_has_credentials(),
                 'message': '微信公众号请填写 AppID / AppSecret'}
+    existing = LOGIN_PROCESSES.get(platform)
+    if existing is not None and existing.poll() is None:
+        return {'mode': 'qr', **_login_status(platform)}
     LOGIN_DIR.mkdir(parents=True, exist_ok=True)
     qr = LOGIN_DIR / f'{platform}.png'
     status = LOGIN_DIR / f'{platform}.json'
@@ -3925,9 +3928,14 @@ async def api_login_start(platform: str):
         _WHOAMI_CACHE.pop(platform, None)
     log_path = LOGIN_DIR / f'{platform}.log'
     log_file = log_path.open('a', encoding='utf-8')
-    proc = subprocess.Popen(cmd, cwd=str(PROJECT_ROOT), env=_proxy_env(),
-                            stdout=log_file, stderr=subprocess.STDOUT)
-    log_file.close()
+    login_env = _proxy_env()
+    login_env['PYTHONIOENCODING'] = 'utf-8'
+    login_env['PYTHONUTF8'] = '1'
+    try:
+        proc = subprocess.Popen(cmd, cwd=str(PROJECT_ROOT), env=login_env,
+                                stdout=log_file, stderr=subprocess.STDOUT)
+    finally:
+        log_file.close()
     LOGIN_PROCESSES[platform] = proc
     for _ in range(50):
         await asyncio.sleep(0.5)

@@ -34,9 +34,11 @@ import re
 import sys
 import time
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import login_state  # noqa: E402
+import login_qr
 import content_guard  # noqa: E402  出站内容安全闸门
 
 # --------------------------------------------------------------------------- #
@@ -50,7 +52,8 @@ TITLE_MAX = 20  # 小红书标题上限（全角计法，见 calc_title_length�
 SELECTORS = {
     # 登录（REF login.go）
     "login_ok": ".main-container .user .link-wrapper .channel",
-    "qrcode": ".login-container .qrcode-img",
+    "qrcode": ".login-container .qrcode-img, .qrcode-img, [class*='qrcode' i] img, "
+              "[class*='qrcode' i] canvas, [class*='qr-code' i], img[src*='qrcode' i]",
     # 进页/切 tab（REF publish.go mustClickPublishTab）
     "upload_content": "div.upload-content",
     "creator_tab": "div.creator-tab",
@@ -232,25 +235,74 @@ def _browser_channel() -> str | None:
     return None
 
 
-def _risk_blocked(page) -> bool:
+def _login_error(page) -> str:
+    """区分明确 IP 风险和其它错误页，不泄露 URL 中的登录参数。"""
     try:
         url = page.url or ""
         title = page.title() or ""
-        return ("website-login/error" in url or "error_code=300012" in url
-                or "安全限制" in title)
+        codes = parse_qs(urlparse(url).query).get("error_code", [])
+        code = codes[0] if codes and codes[0].isdigit() and len(codes[0]) <= 32 else ""
+        error_page = "website-login/error" in url or "安全限制" in title or bool(code)
+        if not error_page:
+            return ""
+        try:
+            text = page.inner_text("body", timeout=2000)[:3000]
+        except Exception:
+            text = ""
+        if code == "300012" or "IP存在风险" in re.sub(r"\s+", "", text).upper():
+            detail = f"（错误码 {code}）" if code else ""
+            return (f"小红书返回 IP 风险限制{detail}，二维码无法获取。"
+                    "请在可信网络重试；服务器/机房出口可能被平台限制，Easel 无法保证解除风控。")
+        detail = f"（错误码 {code}）" if code else ""
+        return f"小红书登录被平台拦截{detail}，不一定是 IP 问题。请检查网络，或使用 --headed 查看平台提示。"
     except Exception:
-        return False
+        return ""
+
+
+def _risk_blocked(page) -> bool:
+    return "IP 风险限制" in _login_error(page)
+
+
+def _capture_login_qr(page, qr_out: Path) -> bool:
+    """首页无法出码时只尝试一次官方创作平台入口；False 表示已登录。"""
+    for url in (None, CREATOR_LOGIN_URL):
+        if url:
+            page.goto(url, wait_until="domcontentloaded", timeout=45000)
+            page.wait_for_timeout(1500)
+        if _is_logged_in(page):
+            return False
+        reason = _login_error(page)
+        if not reason:
+            try:
+                for element in page.query_selector_all(
+                        "button:has-text('扫码登录'), [role='tab']:has-text('扫码登录'), "
+                        ".login-type:has-text('扫码登录')"):
+                    if element.is_visible():
+                        element.click(timeout=3000)
+                        break
+                try:
+                    page.wait_for_selector(SELECTORS["qrcode"], timeout=15000, state="visible")
+                except Exception:
+                    pass
+                login_qr.capture_qr(page, qr_out, SELECTORS["qrcode"])
+                return True
+            except Exception:
+                reason = _login_error(page) or "未找到可识别的登录二维码，页面可能改版或要求其它登录方式"
+    raise RuntimeError(reason)
 
 
 def _is_logged_in(page) -> bool:
     try:
-        if page.query_selector(SELECTORS["login_ok"]) is not None:
-            return True
+        for element in page.query_selector_all(SELECTORS["login_ok"]):
+            if element.is_visible():
+                return True
     except Exception:
         pass
     try:
-        url = (page.url or "").split("?", 1)[0]
-        if "creator.xiaohongshu.com" in url and "/login" not in url:
+        url = urlparse(page.url or "")
+        if (url.hostname == "creator.xiaohongshu.com"
+                and not parse_qs(url.query).get("error_code")
+                and (url.path.startswith(("/publish/", "/new/", "/home/")) or url.path == "/home")):
             return True
     except Exception:
         pass
@@ -674,18 +726,8 @@ def cmd_login(a) -> int:
                 # 等待页面稳定并完成可能的跳转（登录引导 / 风险拦截 / 已登录态）
                 for _ in range(10):
                     page.wait_for_timeout(800)
-                    if _risk_blocked(page):
-                        if a.headed:
-                            page.goto(CREATOR_LOGIN_URL, wait_until="domcontentloaded", timeout=45000)
-                            login_state.write_status(
-                                sf, "window_login",
-                                "首页被风控拦截了，已改开创作平台。请在弹出的 CloakBrowser 窗口里扫码或短信登录。")
-                            break
-                        login_state.write_status(sf, "error", "IP 存在风险，需干净网络/代理")
-                        _die("小红书判定当前网络为风险 IP（安全限制 300012「IP存在风险，请切换可靠网络环境」）——"
-                             "二维码在此环境无法弹出。解决：①用干净/家宽 IP 的代理 `--proxy socks5://...`；"
-                             "②在正常网络的机器上 login 拿到登录态，再把持久化目录 "
-                             f"{_profile_dir(a.profile_base)} 整个拷到本机复用。", 4)
+                    if _login_error(page):
+                        break
                     try:
                         if _is_logged_in(page):
                             break
@@ -693,31 +735,25 @@ def cmd_login(a) -> int:
                         pass
 
                 if _is_logged_in(page):
-                    print("✅ 已登录（cookie 已在持久化目录），无需扫码")
                     login_state.write_status(sf, "success", "已登录")
+                    print("✅ 已登录（cookie 已在持久化目录），无需扫码")
                     return 0
 
                 # 抠二维码存 PNG（元素截图，不依赖 src 格式，最稳）
-                qr = None
+                qr = False
                 try:
-                    qr = _wait_sel(page, SELECTORS["qrcode"], 20000, "登录二维码")
-                except Exception:
-                    if _risk_blocked(page) and not a.headed:
-                        login_state.write_status(sf, "error", "IP 存在风险，需干净网络/代理")
-                        _die("小红书判定当前网络为风险 IP（安全限制 300012「IP存在风险，请切换可靠网络环境」）——"
-                             "二维码在此环境无法弹出。解决：①用干净/家宽 IP 的代理 `--proxy socks5://...`；"
-                             "②在正常网络的机器上 login 拿到登录态，再把持久化目录 "
-                             f"{_profile_dir(a.profile_base)} 整个拷到本机复用。", 4)
+                    qr = _capture_login_qr(page, qr_out)
+                    if not qr:
+                        login_state.write_status(sf, "success", "已登录")
+                        print("✅ 已登录（创作平台登录态已在持久化目录），无需扫码")
+                        return 0
+                except Exception as error:
                     if not a.headed:
-                        login_state.write_status(sf, "error", "未找到登录二维码")
-                        _die("未找到登录二维码（页面结构可能已变，检查 SELECTORS.qrcode），"
-                             "或已弹别的登录方式——可加 --headed 观察")
+                        raise
                     login_state.write_status(
                         sf, "window_login",
-                        "请在弹出的 CloakBrowser 窗口里完成登录（扫码或短信），不要关掉那个窗口。")
+                        f"{error}。请在弹出的 CloakBrowser 窗口里完成登录（扫码或短信），不要关掉那个窗口。")
                 if qr:
-                    qr_out.parent.mkdir(parents=True, exist_ok=True)
-                    qr.screenshot(path=str(qr_out))
                     if a.headed:
                         login_state.write_status(
                             sf, "window_login",
@@ -742,8 +778,8 @@ def cmd_login(a) -> int:
                             _die(f"登录窗口已关闭：{e}", 1)
                         logged_in = False
                     if logged_in:
-                        print("✅ 登录成功，cookie 已持久化，下次免登")
                         login_state.write_status(sf, "success", "登录成功")
+                        print("✅ 登录成功，cookie 已持久化，下次免登")
                         try:
                             qr_out.unlink()  # 登录成功清掉二维码图，避免误扫过期码
                         except OSError:
@@ -753,6 +789,10 @@ def cmd_login(a) -> int:
                 login_state.write_status(sf, "expired", "二维码超时未扫")
                 print(f"⏱️ {timeout_s}s 内未检测到登录成功（二维码可能已过期）。请重跑 login 再扫。",
                       file=sys.stderr)
+                return 1
+            except Exception as error:
+                login_state.write_status(sf, "error", f"登录异常：{error}")
+                print(f"小红书登录异常：{error}", file=sys.stderr)
                 return 1
             finally:
                 ctx.close()
@@ -908,7 +948,7 @@ def cmd_whoami(a) -> int:
                 except Exception:
                     pass
                 logged = _is_logged_in(page)
-                if not logged and _risk_blocked(page):
+                if not logged:
                     page.goto(CREATOR_LOGIN_URL, wait_until="domcontentloaded")
                     page.wait_for_timeout(1500)
                     logged = _is_logged_in(page)
@@ -1003,6 +1043,7 @@ def cmd_selftest(_a) -> int:
 
 
 def main() -> int:
+    login_state.configure_stdio()
     ap = argparse.ArgumentParser(
         description="小红书发布（Playwright，headless 可用；流程移植自 xiaohongshu-mcp）",
         formatter_class=argparse.RawDescriptionHelpFormatter)

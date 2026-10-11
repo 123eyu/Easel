@@ -35,6 +35,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import login_state  # noqa: E402
+import login_qr
 import content_guard  # noqa: E402  出站内容安全闸门
 import platform_readback  # noqa: E402  发布读回对账（快手已接入，注册表见 _READBACK_VERIFIERS）
 import human_pace  # noqa: E402  人类节奏（提交前双停顿；EASEL_PACE_SKIP=1 跳过）
@@ -232,6 +233,14 @@ PLATFORMS: dict[str, dict] = {
         "profile": "ZhihuProfile",
         "login_check": ".AppHeader-profile, .AppHeader-userInfo",
         "logged_out_selector": ".SignContainer, .Login-content, button:has-text('登录')",
+        "login_prep": [
+            {"click": "button:has-text('扫码登录'), .SignFlow-qrcodeTab, .SignFlow-qrcode"},
+            {"wait": 800},
+        ],
+        "login_qr_selector": ".Qrcode-img, .SignFlow-qrcode, .SignFlowQRCode, "
+                             "[class*='qrcode' i], img[src*='qr' i], canvas",
+        "qr_loaded": ".Qrcode-img, [class*='qrcode' i] img, [class*='qrcode' i] canvas, canvas",
+        "strict_login_qr": True,
         "me_name_selector": ".AppHeader-profile .name, .ProfileHeader-name, .AppHeader-userInfo .name",
         "me_avatar_selector": ".AppHeader-profile img[src], .Avatar[src]",
         "steps": [
@@ -1032,7 +1041,11 @@ def _crop_qr(page, qr_out, cfg) -> None:
     """把登录二维码裁出来单独存图（而非整页）。遍历平台配置 + 常见选择器的所有候选，
     用 _score_qr_el 挑「最像二维码」的那个（base64/canvas 本体 + 接近正方形 + 尺寸合适），
     而不是遇到第一个宽松方形就用；都不中才退回整页。
+    strict_login_qr 平台则检测图案并裁剪，找不到实际二维码时明确报错，不退回整页。
     ⚠️ 调用前应先等二维码渲染（见 cmd_login_qr 的 qr_loaded 等待），否则可能截到空框。"""
+    if cfg.get("strict_login_qr"):
+        login_qr.capture_qr(page, qr_out, cfg["login_qr_selector"])
+        return
     cands: list[str] = []
     if cfg.get("login_qr_selector"):  # 拆逗号逐个试，保证具体选择器优先于容器
         cands += [s.strip() for s in cfg["login_qr_selector"].split(",") if s.strip()]
@@ -1156,9 +1169,10 @@ def cmd_login_qr(a) -> int:
             for step in cfg.get("login_prep", []):
                 try:
                     if "click" in step:
-                        el = page.query_selector(step["click"])
-                        if el:
-                            el.click()
+                        for el in page.query_selector_all(step["click"]):
+                            if el.is_visible():
+                                el.click(timeout=3000)
+                                break
                     if "wait" in step:
                         page.wait_for_timeout(step["wait"])
                 except Exception:
@@ -1436,6 +1450,7 @@ def cmd_selftest(_a) -> int:
 
 
 def main() -> int:
+    login_state.configure_stdio()
     ap = argparse.ArgumentParser(
         description="通用浏览器发布框架（Playwright，配置驱动，登录态持久化）",
         formatter_class=argparse.RawDescriptionHelpFormatter)
