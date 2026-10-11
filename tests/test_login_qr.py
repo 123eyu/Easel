@@ -24,11 +24,51 @@ import web_publisher
 import xhs_publish
 
 
-def qr_bytes(scale=3):
+def qr_bytes(scale=3, border=4, content="easel-offline-login-test"):
     output = io.BytesIO()
-    segno.make("easel-offline-login-test", micro=False).save(
-        output, kind="png", scale=scale, border=4)
+    segno.make(content, micro=False).save(
+        output, kind="png", scale=scale, border=border)
     return output.getvalue()
+
+
+@pytest.mark.parametrize("scale", [2, 3, 5])
+def test_qr_without_image_quiet_zone_is_detected(tmp_path, scale):
+    output = tmp_path / "qr.png"
+    assert login_qr.save_qr(qr_bytes(scale=scale, border=0), output)
+
+
+def test_unchanged_qr_does_not_rewrite_and_changed_qr_refreshes(tmp_path):
+    output = tmp_path / "qr.png"
+    assert login_qr.save_qr(qr_bytes(), output)
+    original = output.read_bytes()
+    os.utime(output, ns=(1_000_000_000, 1_000_000_000))
+    assert login_qr.save_qr(qr_bytes(), output)
+    assert output.stat().st_mtime_ns == 1_000_000_000
+    assert login_qr.save_qr(qr_bytes(content="easel-refreshed-login-test"), output)
+    assert output.read_bytes() != original
+    assert output.stat().st_mtime_ns != 1_000_000_000
+
+
+def test_failed_atomic_save_keeps_previous_qr_and_cleans_temp(tmp_path, monkeypatch):
+    output = tmp_path / "qr.png"
+    assert login_qr.save_qr(qr_bytes(), output)
+    original = output.read_bytes()
+    monkeypatch.setattr(os, "replace", Mock(side_effect=OSError("replace failed")))
+    with pytest.raises(OSError, match="replace failed"):
+        login_qr.save_qr(qr_bytes(content="easel-refreshed-login-test"), output)
+    assert output.read_bytes() == original
+    assert list(tmp_path.iterdir()) == [output]
+
+
+def test_transparent_qr_is_composited_on_white(tmp_path):
+    source = Image.open(io.BytesIO(qr_bytes(border=0))).convert("RGBA")
+    source.putdata([
+        (0, 0, 0, 255) if source.getpixel((column, row))[0] == 0 else (0, 0, 0, 0)
+        for row in range(source.height) for column in range(source.width)
+    ])
+    encoded = io.BytesIO()
+    source.save(encoded, format="PNG")
+    assert login_qr.save_qr(encoded.getvalue(), tmp_path / "qr.png")
 
 
 @pytest.mark.parametrize("scale", [2, 3, 5, 8])
@@ -115,6 +155,78 @@ def test_qr_capture_retries_unloaded_image_and_skips_hidden(tmp_path):
     page.wait_for_timeout.assert_called_once_with(800)
 
 
+def test_qr_refresh_missing_candidate_keeps_previous_image(tmp_path):
+    output = tmp_path / "qr.png"
+    assert login_qr.save_qr(qr_bytes(), output)
+    original = output.read_bytes()
+    page = SimpleNamespace(query_selector_all=lambda selector: [], wait_for_timeout=Mock())
+    with pytest.raises(RuntimeError, match="未找到可识别"):
+        login_qr.capture_qr(page, output, ".qrcode-img", attempts=1)
+    assert output.read_bytes() == original
+    page.wait_for_timeout.assert_not_called()
+
+
+@pytest.mark.parametrize("url", ["https://www.zhihu.com/", "https://www.zhihu.com/error"])
+def test_zhihu_anonymous_redirect_is_not_a_login(url):
+    page = SimpleNamespace(url=url, query_selector=lambda selector: None)
+    assert not web_publisher._is_logged_in(page, web_publisher.PLATFORMS["zhihu"])
+
+
+@pytest.mark.parametrize("visible,wall,expected", [
+    (True, False, True), (False, False, False), (True, True, False),
+])
+def test_zhihu_requires_visible_account_and_no_login_wall(visible, wall, expected):
+    def query(selector):
+        if selector == ".AppHeader-profile":
+            return SimpleNamespace(is_visible=lambda: visible)
+        if selector == ".SignContainer":
+            return SimpleNamespace(is_visible=lambda: wall)
+        return None
+
+    page = SimpleNamespace(url="https://www.zhihu.com/", query_selector=query)
+    assert web_publisher._is_logged_in(page, web_publisher.PLATFORMS["zhihu"]) is expected
+
+
+def test_zhihu_switches_to_qr_only_when_missing(tmp_path):
+    ready = False
+    clicked = []
+
+    def click(**kwargs):
+        nonlocal ready
+        ready = True
+        clicked.append(True)
+
+    cfg = web_publisher.PLATFORMS["zhihu"]
+    button = SimpleNamespace(is_visible=lambda: True, click=click)
+
+    def query(selector):
+        if selector == cfg["login_qr_switch"]:
+            return [button]
+        if selector == ".Qrcode-img" and ready:
+            return [qr_element()]
+        return []
+
+    page = SimpleNamespace(query_selector_all=query, wait_for_timeout=Mock(),
+                           wait_for_selector=Mock())
+    output = tmp_path / "qr.png"
+    login_qr.prepare_qr(page, output, cfg["login_qr_selector"], cfg["login_qr_switch"])
+    login_qr.prepare_qr(page, output, cfg["login_qr_selector"], cfg["login_qr_switch"])
+    assert clicked == [True]
+
+
+def test_qr_preparation_waits_for_async_page_before_switching(tmp_path):
+    ready = False
+
+    def wait(selector, **kwargs):
+        nonlocal ready
+        ready = True
+
+    page = SimpleNamespace(
+        wait_for_selector=wait,
+        query_selector_all=lambda selector: [qr_element()] if ready and selector == ".qr" else [])
+    login_qr.prepare_qr(page, tmp_path / "qr.png", ".qr", "button")
+
+
 @pytest.mark.parametrize("script", ["xhs_publish.py", "web_publisher.py"])
 def test_gbk_stdio_does_not_crash_runner(tmp_path, script):
     env = dict(os.environ, PYTHONIOENCODING="gbk:strict", PYTHONUTF8="0")
@@ -185,8 +297,47 @@ def test_error_message_does_not_leak_url_login_tokens():
 ])
 def test_xhs_requires_visible_anchor_or_creator_authenticated_route(url, visible, logged):
     page = xhs_page(url)
-    page.query_selector_all = lambda selector: [SimpleNamespace(is_visible=lambda: visible)]
+    page.query_selector_all = lambda selector: [SimpleNamespace(is_visible=lambda: visible)] \
+        if selector == xhs_publish.SELECTORS["login_ok"] else []
     assert xhs_publish._is_logged_in(page) is logged
+
+
+@pytest.mark.parametrize("visible", [True, False])
+def test_creator_authenticated_route_with_login_wall_is_not_logged_in(visible):
+    page = xhs_page("https://creator.xiaohongshu.com/publish/publish")
+    page.query_selector_all = lambda selector: [SimpleNamespace(is_visible=lambda: visible)] \
+        if selector == xhs_publish.SELECTORS["logged_out"] else []
+    assert xhs_publish._is_logged_in(page) is not visible
+
+
+def test_xhs_existing_qr_is_not_toggled_back_to_sms(tmp_path, monkeypatch):
+    page = xhs_page()
+    button = SimpleNamespace(is_visible=lambda: True, click=Mock())
+    page.query_selector_all = lambda selector: [button] if "扫码登录" in selector else []
+    monkeypatch.setattr(login_qr, "capture_qr", Mock())
+    assert xhs_publish._capture_login_qr(page, tmp_path / "qr.png")
+    button.click.assert_not_called()
+
+
+def test_xhs_creator_navigation_failure_has_actionable_message(tmp_path, monkeypatch):
+    page = xhs_page()
+    page.goto.side_effect = TimeoutError("sensitive_url?token=private")
+    monkeypatch.setattr(login_qr, "capture_qr", Mock(side_effect=RuntimeError("missing qr")))
+    with pytest.raises(RuntimeError, match="创作平台.*TimeoutError") as error:
+        xhs_publish._capture_login_qr(page, tmp_path / "qr.png")
+    assert "private" not in str(error.value)
+
+
+def test_xhs_login_during_capture_is_not_reported_as_error(tmp_path, monkeypatch):
+    page = xhs_page()
+
+    def capture(*args, **kwargs):
+        page.url = "https://creator.xiaohongshu.com/home"
+        raise RuntimeError("login redirect removed qr")
+
+    monkeypatch.setattr(login_qr, "capture_qr", capture)
+    assert not xhs_publish._capture_login_qr(page, tmp_path / "qr.png")
+    page.goto.assert_not_called()
 
 
 def test_xhs_headless_risk_falls_back_to_creator_once(tmp_path, monkeypatch):
@@ -232,11 +383,15 @@ def test_creator_existing_login_does_not_request_qr(tmp_path, monkeypatch):
     (False, "success"),
     (True, "expired"),
 ])
+@pytest.mark.parametrize("explore_timeout", [False, True])
 def test_xhs_runner_persists_terminal_status_and_closes_browser(tmp_path, monkeypatch,
-                                                              capture_result, expected):
+                                                              capture_result, expected,
+                                                              explore_timeout):
     from playwright import sync_api
 
     page = xhs_page()
+    if explore_timeout:
+        page.goto.side_effect = TimeoutError("homepage timeout")
     context = SimpleNamespace(pages=[page], close=Mock())
 
     class Manager:
@@ -261,6 +416,81 @@ def test_xhs_runner_persists_terminal_status_and_closes_browser(tmp_path, monkey
     if expected == "error":
         assert "300013" in status["message"]
     context.close.assert_called_once()
+    capture.assert_called_once_with(page, Path(args.qr_out), creator_only=explore_timeout)
+
+
+@pytest.mark.parametrize("platform", ["xiaohongshu", "zhihu"])
+@pytest.mark.parametrize("refresh_missing", [False, True])
+def test_login_runner_refreshes_qr_and_handles_success(tmp_path, monkeypatch, platform,
+                                                      refresh_missing):
+    from playwright import sync_api
+
+    page = xhs_page()
+    page.wait_for_selector = Mock()
+    context = SimpleNamespace(pages=[page], close=Mock())
+
+    class Manager:
+        def __enter__(self):
+            return SimpleNamespace(chromium=SimpleNamespace(
+                launch_persistent_context=lambda *args, **kwargs: context))
+
+        def __exit__(self, *args):
+            return False
+
+    monkeypatch.setattr(sync_api, "sync_playwright", Manager)
+    clock = iter([0, 6, 6, 7])
+    monkeypatch.setattr(xhs_publish.time, "monotonic", lambda: next(clock))
+    refresh = Mock(side_effect=RuntimeError("redirect removed qr") if refresh_missing else None)
+    monkeypatch.setattr(login_qr, "capture_qr", refresh)
+    args = SimpleNamespace(platform=platform, qr_out=str(tmp_path / "qr.png"), timeout=30,
+                           status_file=str(tmp_path / "status.json"),
+                           profile_base=str(tmp_path / "profiles"), headed=False,
+                           proxy=None, no_proxy=True)
+    if platform == "xiaohongshu":
+        monkeypatch.setattr(xhs_publish, "_launch", lambda *args, **kwargs: context)
+        monkeypatch.setattr(xhs_publish, "_is_logged_in", Mock(side_effect=[False, False, True]))
+        monkeypatch.setattr(xhs_publish, "_capture_login_qr", Mock(return_value=True))
+        errors = iter(["stop settling", ""])
+        monkeypatch.setattr(xhs_publish, "_login_error", lambda page: next(errors))
+        assert xhs_publish.cmd_login(args) == 0
+        selectors = xhs_publish.SELECTORS["qrcode"]
+    else:
+        monkeypatch.setattr(web_publisher, "_is_logged_in", Mock(side_effect=[False, False, True]))
+        monkeypatch.setattr(login_qr, "prepare_qr", Mock())
+        assert web_publisher.cmd_login_qr(args) == 0
+        selectors = web_publisher.PLATFORMS["zhihu"]["login_qr_selector"]
+    refresh.assert_called_once_with(page, Path(args.qr_out), selectors, attempts=1)
+    assert login_state.read_status(args.status_file)["state"] == "success"
+    context.close.assert_called_once()
+
+
+@pytest.mark.parametrize("launch_failure", [False, True])
+def test_zhihu_runner_handles_launch_failure_or_login_during_capture(tmp_path, monkeypatch,
+                                                                 launch_failure):
+    from playwright import sync_api
+
+    page = xhs_page()
+    page.wait_for_selector = Mock()
+    context = SimpleNamespace(pages=[page], close=Mock())
+    launch = Mock(side_effect=RuntimeError("browser failed")) if launch_failure \
+        else Mock(return_value=context)
+
+    class Manager:
+        def __enter__(self):
+            return SimpleNamespace(chromium=SimpleNamespace(launch_persistent_context=launch))
+
+        def __exit__(self, *args):
+            return False
+
+    monkeypatch.setattr(sync_api, "sync_playwright", Manager)
+    monkeypatch.setattr(web_publisher, "_is_logged_in", Mock(side_effect=[False, True]))
+    monkeypatch.setattr(login_qr, "prepare_qr", Mock(side_effect=RuntimeError("redirect removed qr")))
+    args = SimpleNamespace(platform="zhihu", qr_out=str(tmp_path / "qr.png"), timeout=30,
+                           status_file=str(tmp_path / "status.json"),
+                           profile_base=str(tmp_path / "profiles"))
+    assert web_publisher.cmd_login_qr(args) == (1 if launch_failure else 0)
+    assert login_state.read_status(args.status_file)["state"] == ("error" if launch_failure else "success")
+    assert context.close.call_count == (0 if launch_failure else 1)
 
 
 def web_functions():
@@ -295,6 +525,18 @@ def test_web_preserves_terminal_status_and_hides_stale_qr(tmp_path, state):
     status = env["_login_status"]("zhihu")
     assert status["state"] == state
     assert status["qr"] == ""
+
+
+def test_web_qr_cache_key_changes_within_same_second(tmp_path):
+    env = web_functions()
+    login_state.write_status(str(tmp_path / "zhihu.json"), "qr_ready")
+    output = tmp_path / "zhihu.png"
+    output.write_bytes(b"qr")
+    env.update(LOGIN_DIR=tmp_path, LOGIN_PROCESSES={})
+    os.utime(output, ns=(1_100_000_000, 1_100_000_000))
+    first = env["_login_status"]("zhihu")["qrTs"]
+    os.utime(output, ns=(1_200_000_000, 1_200_000_000))
+    assert env["_login_status"]("zhihu")["qrTs"] != first
 
 
 def test_repeated_web_login_preserves_existing_process_and_qr():

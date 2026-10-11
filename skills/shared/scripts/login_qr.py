@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import io
 import math
+import os
 from pathlib import Path
+import tempfile
 
 
 def save_qr(image_bytes: bytes, output: Path) -> bool:
@@ -12,7 +14,11 @@ def save_qr(image_bytes: bytes, output: Path) -> bool:
     import numpy as np
     from PIL import Image, ImageOps
 
-    image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    source = Image.open(io.BytesIO(image_bytes)).convert("RGBA")
+    image = Image.new("RGBA", source.size, "white")
+    image.alpha_composite(source)
+    image = image.convert("RGB")
+    image = ImageOps.expand(image, border=max(8, math.ceil(max(image.size) * 0.12)), fill="white")
     pixels = cv2.cvtColor(np.asarray(image), cv2.COLOR_RGB2GRAY)
     detector = cv2.QRCodeDetector()
     found, points = detector.detect(pixels)
@@ -39,16 +45,33 @@ def save_qr(image_bytes: bytes, output: Path) -> bool:
             (round(cropped.width * scale), round(cropped.height * scale)),
             Image.Resampling.NEAREST)
     output.parent.mkdir(parents=True, exist_ok=True)
-    cropped.save(output, format="PNG")
+    encoded = io.BytesIO()
+    cropped.save(encoded, format="PNG")
+    png_bytes = encoded.getvalue()
+    try:
+        if output.read_bytes() == png_bytes:
+            return True
+    except FileNotFoundError:
+        pass
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=output.parent, prefix=f".{output.name}.",
+                                         suffix=".tmp", delete=False) as stream:
+            temporary = Path(stream.name)
+            stream.write(png_bytes)
+        os.replace(temporary, output)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
     return True
 
 
-def capture_qr(page, output: Path, selectors: str) -> None:
+def capture_qr(page, output: Path, selectors: str, *, attempts: int = 3) -> None:
     """遍历可见图片/画布及二维码容器，等待实际像素就绪后裁剪。"""
     candidates = [selector.strip() for selector in selectors.split(",") if selector.strip()]
     leaf_selectors = [f"{selector} img, {selector} canvas" for selector in candidates]
     selector_list = leaf_selectors + candidates
-    for attempt in range(3):
+    for attempt in range(attempts):
         seen = set()
         for selector in selector_list:
             try:
@@ -72,6 +95,29 @@ def capture_qr(page, output: Path, selectors: str) -> None:
                         return
                 except Exception:
                     continue
-        if attempt < 2:
+        if attempt < attempts - 1:
             page.wait_for_timeout(800)
     raise RuntimeError("未找到可识别的登录二维码；页面可能尚未加载、被平台拦截或需要切换扫码登录")
+
+
+def prepare_qr(page, output: Path, selectors: str, switch_selectors: str) -> None:
+    """已有可识别二维码时不点击切换控件，以免切回短信登录。"""
+    try:
+        page.wait_for_selector(f"{selectors}, {switch_selectors}", timeout=15000, state="visible")
+    except Exception:
+        pass
+    try:
+        capture_qr(page, output, selectors)
+        return
+    except RuntimeError as error:
+        missing = error
+    for element in page.query_selector_all(switch_selectors):
+        if element.is_visible():
+            element.click(timeout=3000)
+            try:
+                page.wait_for_selector(selectors, timeout=15000, state="visible")
+            except Exception:
+                pass
+            capture_qr(page, output, selectors)
+            return
+    raise missing

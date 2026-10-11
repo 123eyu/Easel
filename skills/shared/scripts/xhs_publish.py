@@ -54,6 +54,8 @@ SELECTORS = {
     "login_ok": ".main-container .user .link-wrapper .channel",
     "qrcode": ".login-container .qrcode-img, .qrcode-img, [class*='qrcode' i] img, "
               "[class*='qrcode' i] canvas, [class*='qr-code' i], img[src*='qrcode' i]",
+    "logged_out": ".login-container, .login-modal, .login-box, "
+                  ".qrcode-img, [class*='qrcode' i], [class*='qr-code' i]",
     # 进页/切 tab（REF publish.go mustClickPublishTab）
     "upload_content": "div.upload-content",
     "creator_tab": "div.creator-tab",
@@ -263,35 +265,40 @@ def _risk_blocked(page) -> bool:
     return "IP 风险限制" in _login_error(page)
 
 
-def _capture_login_qr(page, qr_out: Path) -> bool:
+def _capture_login_qr(page, qr_out: Path, *, creator_only: bool = False) -> bool:
     """首页无法出码时只尝试一次官方创作平台入口；False 表示已登录。"""
-    for url in (None, CREATOR_LOGIN_URL):
-        if url:
-            page.goto(url, wait_until="domcontentloaded", timeout=45000)
-            page.wait_for_timeout(1500)
+    reason = "未找到可识别的登录二维码"
+    for url in ((CREATOR_LOGIN_URL,) if creator_only else (None, CREATOR_LOGIN_URL)):
+        try:
+            if url:
+                page.goto(url, wait_until="domcontentloaded", timeout=45000)
+                page.wait_for_timeout(1500)
+        except Exception as error:
+            reason = f"打不开小红书创作平台（{type(error).__name__}），请检查网络连接后重试"
+            continue
         if _is_logged_in(page):
             return False
         reason = _login_error(page)
         if not reason:
             try:
-                for element in page.query_selector_all(
+                login_qr.prepare_qr(page, qr_out, SELECTORS["qrcode"],
                         "button:has-text('扫码登录'), [role='tab']:has-text('扫码登录'), "
-                        ".login-type:has-text('扫码登录')"):
-                    if element.is_visible():
-                        element.click(timeout=3000)
-                        break
-                try:
-                    page.wait_for_selector(SELECTORS["qrcode"], timeout=15000, state="visible")
-                except Exception:
-                    pass
-                login_qr.capture_qr(page, qr_out, SELECTORS["qrcode"])
+                        ".login-type:has-text('扫码登录')")
                 return True
             except Exception:
+                if _is_logged_in(page):
+                    return False
                 reason = _login_error(page) or "未找到可识别的登录二维码，页面可能改版或要求其它登录方式"
     raise RuntimeError(reason)
 
 
 def _is_logged_in(page) -> bool:
+    try:
+        for element in page.query_selector_all(SELECTORS["logged_out"]):
+            if element.is_visible():
+                return False
+    except Exception:
+        pass
     try:
         for element in page.query_selector_all(SELECTORS["login_ok"]):
             if element.is_visible():
@@ -717,14 +724,16 @@ def cmd_login(a) -> int:
                     login_state.write_status(
                         sf, "window_login",
                         "请在弹出的 CloakBrowser 窗口里扫码，不要关掉那个窗口。")
+                explore_failed = False
                 try:
                     page.goto(EXPLORE_URL, wait_until="domcontentloaded", timeout=45000)
-                except Exception as e:
-                    login_state.write_status(sf, "error", f"打不开小红书页面（{type(e).__name__}）")
-                    _die(f"打开 {EXPLORE_URL} 失败：{e}", 1)
+                except Exception as error:
+                    explore_failed = True
+                    print(f"小红书首页无法打开（{type(error).__name__}），尝试官方创作平台入口",
+                          file=sys.stderr)
 
                 # 等待页面稳定并完成可能的跳转（登录引导 / 风险拦截 / 已登录态）
-                for _ in range(10):
+                for _ in range(0 if explore_failed else 10):
                     page.wait_for_timeout(800)
                     if _login_error(page):
                         break
@@ -742,7 +751,7 @@ def cmd_login(a) -> int:
                 # 抠二维码存 PNG（元素截图，不依赖 src 格式，最稳）
                 qr = False
                 try:
-                    qr = _capture_login_qr(page, qr_out)
+                    qr = _capture_login_qr(page, qr_out, creator_only=explore_failed)
                     if not qr:
                         login_state.write_status(sf, "success", "已登录")
                         print("✅ 已登录（创作平台登录态已在持久化目录），无需扫码")
@@ -768,6 +777,7 @@ def cmd_login(a) -> int:
 
                 # 轮询登录成功（扫码成功瞬间页面会跳转，查询崩了是正常的，重试继续等）
                 deadline = time.time() + timeout_s
+                next_refresh = time.monotonic() + 5
                 while time.time() < deadline:
                     try:
                         logged_in = _is_logged_in(page)
@@ -785,6 +795,15 @@ def cmd_login(a) -> int:
                         except OSError:
                             pass
                         return 0
+                    reason = _login_error(page)
+                    if reason and not a.headed:
+                        raise RuntimeError(reason)
+                    if qr and time.monotonic() >= next_refresh:
+                        try:
+                            login_qr.capture_qr(page, qr_out, SELECTORS["qrcode"], attempts=1)
+                        except RuntimeError:
+                            pass
+                        next_refresh = time.monotonic() + 5
                     page.wait_for_timeout(2000)
                 login_state.write_status(sf, "expired", "二维码超时未扫")
                 print(f"⏱️ {timeout_s}s 内未检测到登录成功（二维码可能已过期）。请重跑 login 再扫。",

@@ -232,11 +232,10 @@ PLATFORMS: dict[str, dict] = {
         "publish_url": "https://zhuanlan.zhihu.com/write",
         "profile": "ZhihuProfile",
         "login_check": ".AppHeader-profile, .AppHeader-userInfo",
+        "login_strict": True,
         "logged_out_selector": ".SignContainer, .Login-content, button:has-text('登录')",
-        "login_prep": [
-            {"click": "button:has-text('扫码登录'), .SignFlow-qrcodeTab, .SignFlow-qrcode"},
-            {"wait": 800},
-        ],
+        "login_qr_switch": "button:has-text('扫码登录'), [role='tab']:has-text('扫码登录'), "
+                           ".SignFlow-qrcodeTab, .SignFlow-tab--qrcode, .SignFlow-switch:has-text('扫码')",
         "login_qr_selector": ".Qrcode-img, .SignFlow-qrcode, .SignFlowQRCode, "
                              "[class*='qrcode' i], img[src*='qr' i], canvas",
         "qr_loaded": ".Qrcode-img, [class*='qrcode' i] img, [class*='qrcode' i] canvas, canvas",
@@ -1147,11 +1146,12 @@ def cmd_login_qr(a) -> int:
 
     login_state.write_status(sf, "starting")
     with sync_playwright() as p:
-        browser = p.chromium.launch_persistent_context(
-            str(profile), headless=True, locale="zh-CN",
-            args=LAUNCH_ARGS + ["--no-proxy-server"])
-        page = browser.pages[0] if browser.pages else browser.new_page()
+        browser = None
         try:
+            browser = p.chromium.launch_persistent_context(
+                str(profile), headless=True, locale="zh-CN",
+                args=LAUNCH_ARGS + ["--no-proxy-server"])
+            page = browser.pages[0] if browser.pages else browser.new_page()
             _block_heavy(browser, a.platform)
             page.goto(cfg["login_url"], wait_until="domcontentloaded")
             # 给客户端 redirect + 登录态渲染时间：已登录常从入口页跳到 /profile 等，
@@ -1181,7 +1181,17 @@ def cmd_login_qr(a) -> int:
             # 截二维码为 PNG。视频号等把码放在跨域 iframe 里（主页面找不到）→ 截 iframe 元素本体；
             # 其余平台在主页面异步渲染（base64/canvas）→ 先等渲染再按打分裁剪。统一走 _capture_qr。
             qr_out.parent.mkdir(parents=True, exist_ok=True)
-            _capture_qr(page, qr_out, cfg)
+            try:
+                if cfg.get("login_qr_switch"):
+                    login_qr.prepare_qr(page, qr_out, cfg["login_qr_selector"], cfg["login_qr_switch"])
+                else:
+                    _capture_qr(page, qr_out, cfg)
+            except Exception:
+                if not _is_logged_in(page, cfg):
+                    raise
+                login_state.write_status(sf, "success", "已登录")
+                print(f"✅ {cfg['name']} 已登录（登录态在持久化目录）")
+                return 0
             login_state.write_status(sf, "qr_ready", f"扫码登录 {cfg['name']}", qr=str(qr_out))
             print(f"📱 {cfg['name']} 登录页/二维码已保存：{qr_out}", file=sys.stderr)
             print(f"⏳ 等待扫码（最长 {timeout_s}s）...", file=sys.stderr)
@@ -1189,6 +1199,7 @@ def cmd_login_qr(a) -> int:
             confirmed = False
             tick = 0
             deadline = time.time() + timeout_s
+            next_refresh = time.monotonic() + 5
             while time.time() < deadline:
                 tick += 1
                 if _is_logged_in(page, cfg):
@@ -1204,6 +1215,12 @@ def cmd_login_qr(a) -> int:
                     if _probe_logged_in(browser, cfg):
                         confirmed = True
                         break
+                if cfg.get("strict_login_qr") and time.monotonic() >= next_refresh:
+                    try:
+                        login_qr.capture_qr(page, qr_out, cfg["login_qr_selector"], attempts=1)
+                    except RuntimeError:
+                        pass
+                    next_refresh = time.monotonic() + 5
                 page.wait_for_timeout(_LOGIN_POLL_MS)
             if confirmed:
                 login_state.write_status(sf, "success", "登录成功")
@@ -1221,7 +1238,8 @@ def cmd_login_qr(a) -> int:
             print(f"❌ {cfg['name']} 登录异常：{e}", file=sys.stderr)
             return 1
         finally:
-            browser.close()
+            if browser is not None:
+                browser.close()
 
 
 def cmd_publish(a) -> int:

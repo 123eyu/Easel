@@ -3858,7 +3858,7 @@ def _login_status(platform: str) -> dict:
     if data['state'] in ('qr_ready', 'window_login') and qr.is_file():
         data['qr'] = f'_login/{platform}.png'
         try:
-            data['qrTs'] = int(qr.stat().st_mtime)   # 二维码 mtime 作缓存键：码每刷新一次就变，前端 img 随之刷新
+            data['qrTs'] = qr.stat().st_mtime_ns // 1_000_000
         except OSError:
             data['qrTs'] = 0
     else:
