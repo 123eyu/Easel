@@ -11,7 +11,11 @@ Linux 上做解析和 PSScriptAnalyzer，但**复现不了 Windows PowerShell 5.
 from __future__ import annotations
 
 import re
+import shutil
+import subprocess
 from pathlib import Path
+
+import pytest
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SETUP_PS1 = PROJECT_ROOT / "setup.ps1"
@@ -20,6 +24,57 @@ GATEWAY_PS1 = PROJECT_ROOT / "scripts" / "gateway.ps1"
 
 def _read(p: Path) -> str:
     return p.read_text(encoding="utf-8-sig")
+
+
+def test_dependency_install_preserves_process_path() -> None:
+    text = _read(SETUP_PS1)
+    start = text.index("function Install-RequiredCommand")
+    body = text[start:text.index("function Read-EnvFile", start)]
+    assert re.search(r"\$env:Path\s*=\s*\$env:Path\s*\+", body)
+    assert "GetEnvironmentVariable('Path', 'Machine')" in body
+    assert "GetEnvironmentVariable('Path', 'User')" in body
+
+
+@pytest.mark.parametrize("shell_name", ["powershell", "pwsh"])
+def test_dependency_install_path_in_powershell(shell_name: str, tmp_path: Path) -> None:
+    executable = shutil.which(shell_name)
+    if not executable:
+        pytest.skip(f"{shell_name} is unavailable")
+    text = _read(SETUP_PS1)
+    start = text.index("function Assert-Command")
+    functions = text[start:text.index("function Read-EnvFile", start)]
+    script = tmp_path / "path-probe.ps1"
+    script.write_text(
+        "$ErrorActionPreference = 'Stop'\n"
+        + functions
+        + r"""
+function Info($Message) {}
+function Fail($Message) { throw $Message }
+$script:Installed = $false
+function Get-Command($Name, $ErrorAction) {
+    if ($Name -eq 'winget' -or $script:Installed) {
+        return [pscustomobject]@{ Name = $Name }
+    }
+}
+function winget {
+    $script:Installed = $true
+    $global:LASTEXITCODE = 0
+}
+$originalPath = 'C:\easel probe\node;C:\easel probe\python'
+$env:Path = $originalPath
+Install-RequiredCommand 'easel-path-probe' 'Easel.Test' 'mock dependency'
+if (-not $script:Installed) { throw 'Mock dependency was not installed' }
+$expectedPath = $originalPath + ';' + [Environment]::GetEnvironmentVariable('Path', 'Machine') + ';' + [Environment]::GetEnvironmentVariable('Path', 'User')
+if ($env:Path -ne $expectedPath) { throw 'Process PATH was lost or registry PATH was not refreshed' }
+""",
+        encoding="utf-8-sig",
+    )
+    result = subprocess.run(
+        [executable, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+         "-File", str(script)],
+        capture_output=True, text=True, timeout=60,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 def test_all_non_ascii_ps1_files_keep_bom() -> None:

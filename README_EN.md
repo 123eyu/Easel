@@ -193,6 +193,19 @@ easel web
 
 > If you see `easel: command not found`, the virtual environment is not activated. You can also run it by full path without activating, e.g. `.venv/bin/easel doctor` (Windows: `.venv\Scripts\easel.exe doctor`).
 
+For native Windows 10/11, run the following in PowerShell; WSL and Bash are not required:
+
+```powershell
+git clone https://github.com/ZJU-REAL/Easel.git
+cd Easel
+Set-ExecutionPolicy -Scope Process Bypass
+.\setup.ps1
+.\.venv\Scripts\easel.exe doctor
+.\.venv\Scripts\easel.exe web
+```
+
+The Windows installer uses `winget` to install missing system tools when available, creates `.venv`, installs Python and frontend dependencies, builds the Web UI, and installs Playwright Chromium. Easel uses an isolated `easel` OpenClaw profile. Windows PowerShell 5.1 is supported. Native installation and the Web/CLI entry points are available; broader Windows compatibility across individual skills and browser publishing is still being improved.
+
 `bash setup.sh` is a rerunnable installer. It detects and reuses an existing local OpenClaw
 installation without touching `~/.openclaw/`; Easel uses its isolated `~/.openclaw-easel/` profile.
 

@@ -93,7 +93,7 @@ function Install-RequiredCommand($Name, $PackageId, $Hint) {
     Info "未找到 $Name，使用 winget 安装 $PackageId..."
     & winget install --id $PackageId --exact --accept-source-agreements --accept-package-agreements
     if ($LASTEXITCODE -ne 0) { Fail "$Name 自动安装失败。$Hint" }
-    $env:Path = [Environment]::GetEnvironmentVariable('Path', 'Machine') + ';' + [Environment]::GetEnvironmentVariable('Path', 'User')
+    $env:Path = $env:Path + ';' + [Environment]::GetEnvironmentVariable('Path', 'Machine') + ';' + [Environment]::GetEnvironmentVariable('Path', 'User')
     Assert-Command $Name $Hint
 }
 function Read-EnvFile($Path) {
