@@ -1714,6 +1714,7 @@ class HarnessSettingsRequest(BaseModel):
     runtime: str
     model: str = Field(default="", max_length=240)
     sandbox: str = "workspace-write"
+    codex_auto_approve: StrictBool | None = None
 
 
 @app.get("/api/settings/harness")
@@ -1745,6 +1746,8 @@ async def api_harness_settings_save(req: HarnessSettingsRequest):
         _write_env_direct({"EASEL_CHAT_TRANSPORT": "http"})
     config["runtime"] = req.runtime
     config["sandbox"] = req.sandbox
+    if req.runtime == "codex" and req.codex_auto_approve is not None:
+        config["codex_auto_approve"] = req.codex_auto_approve
     config["models"] = {**config["models"], req.runtime: req.model.strip()}
     harness_store.write_json(OUTPUTS_DIR / "_harness" / "config.json", config)
     from easel.harnesses.rpc import close_sessions
@@ -2977,7 +2980,7 @@ async def _run_harness_chat(req: ChatRequest, sk: str, message: str, runtime: st
                "EASEL_ROOT": str(PROJECT_ROOT)}
         request = RunRequest(message, PROJECT_ROOT, env, native_id,
                              config["models"].get(runtime, ""), config["sandbox"], timeout,
-                             session_key=sk)
+                             session_key=sk, codex_auto_approve=config.get("codex_auto_approve", False))
         await asyncio.wait_for(harnesses.adapter(runtime).run(
             request, receive, ask,
             lambda identifier: harness_store.bind(SESSIONS_DIR, sk, runtime, identifier)), timeout)

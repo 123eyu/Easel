@@ -1330,6 +1330,19 @@ textarea.field { resize: vertical; min-height: 90px; }
 .settings-overlay input.mock:focus { outline: none; border-color: #9db3d8; box-shadow: 0 0 0 3px rgba(63, 86, 168, 0.10); }
 .settings-overlay input.mock[disabled] { background: var(--surface-2); color: var(--text-tertiary); }
 .settings-overlay .harness-settings { margin-bottom: 20px; }
+.settings-permission-switch {
+  display: inline-flex; align-items: center; width: 40px; height: 24px; padding: 3px;
+  border: 1px solid var(--border); border-radius: 999px; background: var(--surface-hover);
+  cursor: pointer; transition: background var(--t-fast);
+}
+.settings-permission-switch[aria-checked="true"] { background: var(--accent-start); border-color: var(--accent-start); }
+.settings-permission-switch__thumb {
+  width: 16px; height: 16px; border-radius: 50%; background: var(--bg);
+  box-shadow: var(--shadow-sm); transition: transform var(--t-fast);
+}
+.settings-permission-switch[aria-checked="true"] .settings-permission-switch__thumb { transform: translateX(16px); }
+.settings-permission-switch:focus-visible { outline: 2px solid var(--accent-end); outline-offset: 3px; }
+.settings-permission-switch:disabled { opacity: .5; cursor: default; }
 .settings-overlay .harness-settings .panel-top { flex-wrap: wrap; }
 .settings-overlay .settings-native-models { display: flex; gap: 9px; align-items: center; margin-bottom: 9px; }
 .settings-overlay .settings-native-models .settings-select-wrap { flex: 1; min-width: 0; }

@@ -36,6 +36,7 @@ export interface HarnessSettingsResponse {
   runtime: string;
   models: Record<string, string>;
   sandbox: string;
+  codex_auto_approve: boolean;
   locked: boolean;
   agents: { id: string; label: string; protocol: string; installed: boolean; install_hint: string }[];
 }
@@ -54,11 +55,11 @@ export function fetchHarnessModels(runtime: string): Promise<{ runtime: string; 
   return request(`/api/settings/harness/models/${encodeURIComponent(runtime)}`, { method: 'POST' });
 }
 
-export function saveHarnessSettings(runtime: string, model: string, sandbox: string): Promise<HarnessSettingsResponse> {
+export function saveHarnessSettings(runtime: string, model: string, sandbox: string, codexAutoApprove?: boolean): Promise<HarnessSettingsResponse> {
   return request('/api/settings/harness', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ runtime, model, sandbox }),
+    body: JSON.stringify({ runtime, model, sandbox, codex_auto_approve: codexAutoApprove }),
   });
 }
 
