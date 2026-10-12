@@ -25,6 +25,7 @@ All notable changes to Easel are documented in this file.
 - Improved account verification and nickname/avatar extraction; stale verification responses no longer overwrite newly logged-in accounts.
 - Fixed UTF-8 handling and Windows installation PATH preservation, and improved installer idempotency and configuration validation.
 - Fixed runtime version drift: package metadata and harness protocol handshakes now report the same Easel version.
+- Fixed Python 3.10 compatibility when stopping Agent execution, including repeated-stop protection during process cleanup.
 
 ### Upgrade Notes
 

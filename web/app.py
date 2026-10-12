@@ -2891,11 +2891,17 @@ _HARNESS_QUESTIONS: dict = {}
 
 
 class _HarnessProc(_GatewayHttpProc):
+    def __init__(self) -> None:
+        super().__init__()
+        self._cancel_requested = False
+
     def terminate(self) -> None:
         if self._task is not None:
             task = self._task
             def cancel_once():
-                if not task.done() and not task.cancelling():
+                if (not task.done() and not self._cancel_requested
+                        and not getattr(task, "cancelling", lambda: 0)()):
+                    self._cancel_requested = True
                     task.cancel()
             task.get_loop().call_soon_threadsafe(cancel_once)
 

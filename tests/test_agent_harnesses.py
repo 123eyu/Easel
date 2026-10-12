@@ -802,7 +802,7 @@ def test_web_stop_timeout_and_lock_cleanup(sandbox, monkeypatch):
     asyncio.run(exercise())
 
 
-def test_repeated_stop_does_not_interrupt_process_cleanup():
+def test_repeated_stop_does_not_interrupt_process_cleanup(monkeypatch):
     async def exercise():
         ready = asyncio.Event()
         cleanup_started = asyncio.Event()
@@ -820,12 +820,14 @@ def test_repeated_stop_does_not_interrupt_process_cleanup():
 
         proc = web._HarnessProc()
         proc._task = asyncio.create_task(run())
+        cancel = Mock(wraps=proc._task.cancel)
+        monkeypatch.setattr(proc._task, "cancel", cancel)
         await ready.wait()
         proc.terminate()
         await cleanup_started.wait()
         proc.kill()
         await asyncio.sleep(0)
-        assert proc._task.cancelling() == 1
+        assert cancel.call_count == 1
         finish_cleanup.set()
         with pytest.raises(asyncio.CancelledError):
             await proc._task
