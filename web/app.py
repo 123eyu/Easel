@@ -2923,10 +2923,6 @@ async def api_chat_stream(req: ChatRequest):
         full_text: list[str] = []        # 累积完整回答，供断线取回
         timed_out = False                # 只有真·超时才 terminate 进程；断线绝不杀
 
-        # Claim this turn before waiting for locks, so recovery cannot return the previous turn.
-        if not direct:
-            _save_turn(pk, "running", "", {"turn_id": turn_id})
-
         event_path = _job_event_file(turn_id)
         try:
             event_path.parent.mkdir(parents=True, exist_ok=True)
@@ -3073,14 +3069,18 @@ async def api_chat_stream(req: ChatRequest):
         # flock 可能阻塞（等另一进程/标签跑完），放线程池避免卡住事件循环
         got = await loop.run_in_executor(None, xlock.acquire, min(TIMEOUT_CHAT, 300))
         if not got:
+            xlock.release()
             lock.release()
-            _save_turn(pk, "done", "这个会话正在另一个窗口运行，请稍候再试。", {
-                "turn_id": turn_id, "clean_end": False, "stop_reason": "session_lock_timeout",
-            })
-            to_client("activity", "⏳ 这个会话正在另一个窗口运行，请稍候再试")
+            # This turn never owned the session: report through its own event
+            # log without replacing the active owner's recovery snapshot.
+            to_client("error", "这个会话正在另一个窗口运行，请稍候再试。")
             to_client("done", sessionKey=sk)
             client_q.put_nowait(CLIENT_DONE)
             return
+
+        # Only the owner of both locks may replace the per-session snapshot.
+        # Queued clients recover from their turn log; /last checks turn_id.
+        _save_turn(pk, "running", "", {"turn_id": turn_id})
 
         # _resolve_transport 里既有 stat 又有阻塞 urllib 探针（最多 3s），必须丢线程：
         # 直接在协程里调会把整个事件循环——连同其它会话正在推的 SSE——一起卡住。
@@ -3095,11 +3095,11 @@ async def api_chat_stream(req: ChatRequest):
                     cwd=str(PROJECT_ROOT), text=True, bufsize=1, env=env,
                 )
             except BaseException:
-                lock.release()
-                xlock.release()
                 _save_turn(pk, "done", "❌ 启动失败，请重试", {
                     "turn_id": turn_id, "clean_end": False, "stop_reason": "spawn_failed",
                 })
+                xlock.release()
+                lock.release()
                 to_client("error", "❌ 启动失败，请重试")
                 to_client("done", sessionKey=sk)
                 client_q.put_nowait(CLIENT_DONE)
