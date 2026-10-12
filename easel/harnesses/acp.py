@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import asyncio
 
+from easel import __version__
+
 from .base import Descriptor, HarnessError, RunRequest
 from .workspace import harness_instructions
 from .commands import acp_command, base_command
@@ -51,7 +53,7 @@ class ACPAdapter:
         async with connection(request, command, notify, respond, acp=True) as rpc:
             if rpc.initialized is None:
                 rpc.initialized = await rpc.call("initialize", {
-                    "protocolVersion": 1, "clientInfo": {"name": "easel", "version": "0.2.1"},
+                    "protocolVersion": 1, "clientInfo": {"name": "easel", "version": __version__},
                     "clientCapabilities": {"fs": {"readTextFile": False, "writeTextFile": False},
                                            "terminal": False}})
             initialized = rpc.initialized

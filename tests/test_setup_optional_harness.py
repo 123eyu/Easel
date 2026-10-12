@@ -134,12 +134,13 @@ def test_windows_skip_executes_real_branch_without_calling_openclaw(tmp_path, ex
         "function Invoke-NativeCapture { throw 'Must not invoke OpenClaw or Gateway' }\n"
         + source[install_start:install_end] + source[profile_start:profile_end])
     script_path.write_text(script, encoding="utf-8-sig")
-    environment = {**os.environ, "PYTHONPATH": str(ROOT)}
+    environment = {**os.environ, "PYTHONPATH": str(ROOT), "PYTHONUTF8": "1",
+                   "PYTHONIOENCODING": "utf-8"}
     environment.pop("EASEL_AGENT_RUNTIME", None)
     result = subprocess.run(
         [executable, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(script_path)],
-        cwd=tmp_path, env=environment, capture_output=True, text=True, timeout=30)
-    assert result.returncode == 0, result.stdout + result.stderr
+        cwd=tmp_path, env=environment, capture_output=True, timeout=30)
+    assert result.returncode == 0, (result.stdout + result.stderr).decode("utf-8", errors="replace")
     assert env_file.read_bytes() == original
     assert store.read_json(config_path)["runtime"] == ("codex" if existing else "api")
 

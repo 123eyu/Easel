@@ -151,6 +151,9 @@ def test_web_reuses_native_process_and_resumes_after_cleanup(tmp_path, runtime, 
             assert len(set(identifiers)) == 1
             methods = [message.get("method") for message in audit(tmp_path)]
             assert methods.count("initialize") == 2
+            from easel import __version__
+            assert all(message["params"]["clientInfo"]["version"] == __version__
+                       for message in audit(tmp_path) if message.get("method") == "initialize")
             assert methods.count("thread/resume" if runtime == "codex" else "session/load") == 1
             assert events == [("thinking", "思考"), ("token", "你好")] * 3
         finally:
@@ -789,10 +792,10 @@ def test_web_stop_timeout_and_lock_cleanup(sandbox, monkeypatch):
         await task
         assert result["stopped"] and not web._RUNNING_CHAT and not web._HARNESS_TASKS
         assert not web._session_lock("stoppable").locked()
-        last = json.loads(web._turn_file("web:stoppable").read_text())
+        last = json.loads(web._turn_file("web:stoppable").read_text(encoding="utf-8"))
         assert last["stop_reason"] == "stopped" and not last["clean_end"]
         await web._run_harness_chat(req, "stoppable", "hello", "codex", web._harness_settings(), emit, timeout=0.1)
-        last = json.loads(web._turn_file("web:stoppable").read_text())
+        last = json.loads(web._turn_file("web:stoppable").read_text(encoding="utf-8"))
         assert last["stop_reason"] == "timeout" and not web._session_lock("stoppable").locked()
         assert "执行超时" in last["text"]
 

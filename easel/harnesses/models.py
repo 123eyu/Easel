@@ -5,6 +5,8 @@ import asyncio
 import os
 import signal
 
+from easel import __version__
+
 from .base import HarnessError, RunRequest
 from .commands import base_command
 from .rpc import RPC
@@ -25,7 +27,7 @@ async def available_models(runtime: str, request: RunRequest) -> list[dict]:
         async with RPC(request, base_command("codex") + ["app-server"],
                        lambda method, params: None, reject) as rpc:
             await rpc.call("initialize", {
-                "clientInfo": {"name": "easel", "version": "0.2.1"},
+                "clientInfo": {"name": "easel", "version": __version__},
                 "capabilities": {"experimentalApi": True}}, timeout=15)
             await rpc.send({"method": "initialized"})
             for page in range(20):

@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import asyncio
 
+from easel import __version__
+
 from .base import Descriptor, HarnessError, RunRequest
 from .commands import base_command
 from .rpc import connection
@@ -75,7 +77,7 @@ class CodexAdapter:
         async with connection(request, command, notify, respond) as rpc:
             if rpc.initialized is None:
                 rpc.initialized = await rpc.call("initialize", {
-                    "clientInfo": {"name": "easel", "version": "0.2.1"},
+                    "clientInfo": {"name": "easel", "version": __version__},
                     "capabilities": {"experimentalApi": True}})
                 await rpc.send({"method": "initialized"})
             options = {"cwd": str(request.cwd), "approvalPolicy": "on-request",
