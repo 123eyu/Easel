@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import {
   fetchTrends, fetchSchedule, fetchOutputs, fetchAccounts, fetchIdeas,
   fetchAnalyticsPlatforms, fetchAccountAnalytics,
@@ -33,13 +33,14 @@ interface DashboardProps {
   persona: string;
   gatewayStatus: string;
   apiDirect: boolean;
+  agentRuntime: string;
   onNavigate: (page: Page) => void;
   onUseTopic: (title: string) => void;
 }
 
 const STATUS_LABEL: Record<string, string> = { idea: '选题', draft: '草稿', scheduled: '待发', published: '已发' };
 
-export default function DashboardPage({ persona, gatewayStatus, apiDirect, onNavigate, onUseTopic }: DashboardProps) {
+export default function DashboardPage({ persona, gatewayStatus, apiDirect, agentRuntime, onNavigate, onUseTopic }: DashboardProps) {
   const [trends, setTrends] = useState<TrendGroup[]>([]);
   const [schedule, setSchedule] = useState<ScheduleItem[]>([]);
   const [outputs, setOutputs] = useState<OutputNode[]>([]);
@@ -49,8 +50,15 @@ export default function DashboardPage({ persona, gatewayStatus, apiDirect, onNav
   const [anaPlats, setAnaPlats] = useState<AnalyticsPlatform[]>([]);
   const [anaSel, setAnaSel] = useState('');
   const [anaData, setAnaData] = useState<Record<string, AccountAnalytics | 'loading' | 'error'>>(() => {
-    try { return JSON.parse(localStorage.getItem('easel_analytics') || '{}'); } catch { return {}; }
+    try {
+      const cache = JSON.parse(localStorage.getItem('easel_analytics') || '{}') as Record<string, AccountAnalytics | 'loading' | 'error'>;
+      return Object.fromEntries(Object.entries(cache).filter(([platform, value]) =>
+        value && typeof value === 'object' && value.platform === platform
+        && typeof value.loggedIn === 'boolean'));
+    } catch { return {}; }
   });
+  const anaPending = useRef(new Set<string>());
+  const [anaErrors, setAnaErrors] = useState<Record<string, string>>({});
   const [anaWin, setAnaWin] = useState<'last' | 'day' | 'week' | 'month' | 'year'>('week');
   // whoami 自愈：登录态以真实 profile 为准（与账号页共享 localStorage 缓存）
   const [whoamiMap, setWhoamiMap] = useState<Record<string, AccountWhoami>>(() => getWhoamiCache());
@@ -81,14 +89,24 @@ export default function DashboardPage({ persona, gatewayStatus, apiDirect, onNav
 
   const runAna = (platform: string) => {
     setAnaSel(platform);
+    if (anaPending.current.has(platform)) return;
+    anaPending.current.add(platform);
+    setAnaErrors((errors) => ({ ...errors, [platform]: '' }));
     setAnaData((d) => ({ ...d, [platform]: 'loading' }));
     fetchAccountAnalytics(platform)
       .then((r) => setAnaData((d) => {
         const next = { ...d, [platform]: r };
-        try { localStorage.setItem('easel_analytics', JSON.stringify(next)); } catch { /* quota */ }
+        const cache = Object.fromEntries(Object.entries(next).filter(([, value]) =>
+          value && typeof value === 'object'));
+        try { localStorage.setItem('easel_analytics', JSON.stringify(cache)); } catch { /* quota */ }
         return next;
       }))
-      .catch(() => setAnaData((d) => ({ ...d, [platform]: 'error' as const })));
+      .catch((error: unknown) => {
+        setAnaErrors((errors) => ({ ...errors, [platform]: error instanceof Error
+          ? error.message : '抓取失败，请稍后重试' }));
+        setAnaData((d) => ({ ...d, [platform]: 'error' as const }));
+      })
+      .finally(() => anaPending.current.delete(platform));
   };
 
   const hour = new Date().getHours();
@@ -122,7 +140,10 @@ export default function DashboardPage({ persona, gatewayStatus, apiDirect, onNav
       <div className="dash-hero">
         <h1 className="page-title" style={{ fontSize: 26 }}>{greet} 👋</h1>
         <p className="page-subtitle">
-          {apiDirect ? (gatewayStatus === 'connected' ? 'API 直连已配置，可开始对话。' : '请先配置 API 直连通道。')
+          {apiDirect ? (gatewayStatus === 'connected' ? '仅聊天模式已配置，可开始对话。' : '请先配置仅聊天模式的模型 API。')
+            : agentRuntime !== 'openclaw' ? (gatewayStatus === 'connected'
+            ? `${agentRuntime} CLI 已安装；原生登录及模型可用性请发送消息验证。`
+            : `请先在服务器安装并配置 ${agentRuntime} CLI。`)
             : gatewayStatus === 'connected' ? '一切就绪。' : '⚠ 网关未连接。'}
           {persona ? ` 当前画像「${persona}」。` : ' 通用模式——指定画像效果更好。'}
           从热点到发布，一站式搞定今天的内容。
@@ -245,10 +266,10 @@ export default function DashboardPage({ persona, gatewayStatus, apiDirect, onNav
                 </div>
                 {!d && <div className="dash-empty">点上方平台查看该账号数据</div>}
                 {d === 'loading' && (
-                  <div className="loading" style={{ padding: '28px 0' }}><div className="spinner" />抓取中…（起浏览器，约数秒）</div>
+                  <div className="loading" style={{ padding: '28px 0' }}><div className="spinner" />抓取中…正在校验登录态并读取平台数据</div>
                 )}
                 {d === 'error' && (
-                  <div className="dash-empty" style={{ color: 'var(--red)' }}>抓取失败（未登录 / 需真机校准），点平台重试</div>
+                  <div className="dash-empty" style={{ color: 'var(--red)' }}>{anaErrors[anaSel] || '抓取失败，请稍后重试'}；点平台重试</div>
                 )}
                 {d && d !== 'loading' && d !== 'error' && (!d.loggedIn ? (
                   <div className="dash-empty" onClick={() => onNavigate('accounts')} style={{ cursor: 'pointer' }}>
@@ -256,6 +277,7 @@ export default function DashboardPage({ persona, gatewayStatus, apiDirect, onNav
                   </div>
                 ) : (
                   <div className="ana-body">
+                    {d.warning && <div className="dash-empty" role="status" style={{ gridColumn: '1 / -1' }}>{d.warning}</div>}
                     {/* 概览 + 增长对比 */}
                     <div className="ana-col ana-col-main">
                       <div className="ana-id">{d.nickname ? `@${d.nickname}` : d.name}</div>
