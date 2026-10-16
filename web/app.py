@@ -48,6 +48,7 @@ from easel.openclaw_cmd import openclaw_base_cmd
 from easel.persona import (load_profile_text, persona_prefix, chat_turn_message,
                            profile_exists, valid_persona_name, _FILE_ORDER)
 from easel.timeouts import TIMEOUT_CHAT, TIMEOUT_DIRECT, TIMEOUT_PRODUCE
+from easel.manual_publish import build_package, publishing_mode
 from easel.direct_api import (DirectAPIError, SYSTEM_PROMPT, api_config, api_mode,
                               history_path, read_settings, stream_chat)
 from easel import harnesses
@@ -965,9 +966,19 @@ def _agent_thinking_level() -> str:
     return THINKING_LEVEL
 
 
+def _publishing_message(message: str) -> str:
+    if publishing_mode(read_settings(ENV_FILE)) == "manual":
+        return ("【当前 Web 发布方式：人工提交】AI 只负责创作、排版、素材和审核建议。"
+                "不要调用发布脚本、发布接口、浏览器代填或代点发布。"
+                "引导用户在发布中心审核、复制或导出，再在官方页面亲自提交。"
+                "导出、复制、打开网页和排期均不代表已发布。\n\n" + message)
+    return message
+
+
 def run_agent_sync(msg: str, timeout: int = TIMEOUT_DIRECT, session_id: str | None = None) -> str:
     if _direct_api_enabled():
         raise HTTPException(409, "API 直连模式支持聊天；此操作需要具备文件和技能执行工具的 Agent 运行时")
+    msg = _publishing_message(msg)
     sk = session_id or f'web-{int(time.time() * 1000)}'
     runtime = _chat_backend(session_id)
     if runtime not in ("api", "openclaw"):
@@ -2622,7 +2633,7 @@ def _chat_message(req: ChatRequest) -> str:
         message = f"{message}\n\n{context}" if message else context
     if not message:
         raise HTTPException(400, "消息不能为空")
-    return chat_turn_message(message, req.persona)
+    return _publishing_message(chat_turn_message(message, req.persona))
 
 
 def _direct_chat_content(req: ChatRequest) -> tuple[str | list, str]:
@@ -4798,6 +4809,37 @@ class PublishRequest(BaseModel):
     tags: str = ''
 
 
+class ManualPublishRequest(BaseModel):
+    title: str = Field(default='', max_length=1000)
+    body: str = Field(default='', max_length=100000)
+    tags: str = Field(default='', max_length=2000)
+    media: list[str] = Field(default_factory=list, max_length=32)
+    reviewed: StrictBool = False
+
+
+@app.get("/api/publishing-policy")
+def api_publishing_policy():
+    mode = publishing_mode(read_settings(ENV_FILE))
+    return {"mode": mode, "automaticSubmission": mode == "automated"}
+
+
+def _require_automated_publishing() -> None:
+    if publishing_mode(read_settings(ENV_FILE)) != "automated":
+        raise HTTPException(403, '当前为人工发布模式，请审核后复制或导出，在平台官方发布页亲自提交')
+
+
+@app.post("/api/manual-publish/{platform}/export")
+def api_manual_publish_export(platform: str, req: ManualPublishRequest):
+    """Build a local handoff package; never contact a platform or mark it published."""
+    try:
+        package = build_package(OUTPUTS_DIR, platform, req.title, req.body,
+                                req.tags, req.media, req.reviewed)
+    except ValueError as error:
+        raise HTTPException(400, str(error)) from error
+    return {"path": package.relative_to(OUTPUTS_DIR.resolve()).as_posix(),
+            "filename": package.name, "published": False}
+
+
 def _write_publish_status(status_file: Path, state: str, message: str = '') -> None:
     """写异步发布状态（与 login_state 同格式），原子写。"""
     try:
@@ -4890,6 +4932,7 @@ async def api_publish_status(platform: str):
 @app.post("/api/publish/{platform}/sms")
 async def api_publish_sms(platform: str, req: SmsCodeRequest):
     """发布触发短信墙时回填验证码（写发布 runner 轮询的一次性验证码文件）。"""
+    _require_automated_publishing()
     if platform not in LOGIN_RUNNERS:
         raise HTTPException(404, '未知平台')
     code = ''.join(ch for ch in (req.code or '') if ch.isdigit())
@@ -4903,6 +4946,7 @@ async def api_publish_sms(platform: str, req: SmsCodeRequest):
 @app.post("/api/publish/{platform}")
 async def api_publish(platform: str, req: PublishRequest):
     """一键发布：分发到对应 publisher 脚本真发（--exec）。二次确认在前端。"""
+    _require_automated_publishing()
     cfg = LOGIN_RUNNERS.get(platform)
     if not cfg:
         raise HTTPException(404, '未知平台')
