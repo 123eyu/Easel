@@ -272,6 +272,8 @@ when invoking the OpenClaw CLI rather than requesting an unsupported `medium` le
 
 Never commit `.env`, cookies, or platform login state. Real publishing can be affected by verification, permissions, platform risk controls, and UI changes; use previews and checks for the first attempt.
 
+The Publishing Center defaults to **AI formatting → human review → copy/export → manual submission on the official platform page**. Editing the copy, tags, or media invalidates the previous review. Copying, exporting, and scheduling never mark a post as published. WeChat Official Accounts support rich-text copy and an HTML preview. Set `EASEL_PUBLISH_MODE=automated` in `.env` to explicitly opt into the existing automatic publishing workflow; the default is `manual`. See [the manual publishing guide](docs/manual-publishing.md) for configuration, browser login boundaries, and exports.
+
 ## 🧩 Using Easel
 
 | Command | Purpose |

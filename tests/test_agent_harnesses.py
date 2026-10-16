@@ -725,7 +725,8 @@ def test_background_skill_runs_on_web_loop_without_openclaw(sandbox, monkeypatch
 
     monkeypatch.setattr(web.harnesses, "adapter", lambda runtime: Fake())
     assert web.run_agent_sync("read public skill", timeout=10) == "skill complete"
-    assert requests[0].prompt == "read public skill"
+    assert requests[0].prompt.endswith("read public skill")
+    assert "人工提交" in requests[0].prompt
     assert not web._RUNNING_CHAT and not web._HARNESS_TASKS
 
 
