@@ -1006,6 +1006,8 @@ def run_agent_sync(msg: str, timeout: int = TIMEOUT_DIRECT, session_id: str | No
     xlock = _CrossProcLock(sk)
     if not xlock.acquire(timeout=min(timeout, 300)):
         return '⏳ 这个会话正在另一个窗口运行，请稍候再试'
+    # 同 supervisor：先拿到锁再 heal，避免与正在追加 transcript 的进程并发重写丢行
+    _heal_openclaw_session(sk)
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, cwd=str(PROJECT_ROOT), timeout=timeout + 30, env=_proxy_env())
         out = clean_agent_output(r.stdout or '')
@@ -1257,7 +1259,7 @@ async def api_settings_bootstrap():
         'envKeyOk': env_ok,
         'routeOk': bool(route_ok),
         'routeDetail': route_detail,
-        'gatewayUp': bool(route_ok) if direct else bool(check_gateway()),
+        'gatewayUp': bool(route_ok) if direct else bool(await asyncio.to_thread(check_gateway)),
         'openclawConfigExists': _oc_config_path().is_file(),
         'installWarnings': warnings,
     }
@@ -1294,7 +1296,8 @@ async def api_gateway_restart():
         return {'ok': False, 'note': '重启超时；可稍后刷新，或手动运行 bash scripts/gateway.sh restart'}
     except Exception as e:  # noqa: BLE001
         return {'ok': False, 'note': f'重启失败：{e}'}
-    up = check_gateway()
+    # check_gateway 里有阻塞的 urllib 探针（最多 3s）：丢线程，别卡事件循环
+    up = await asyncio.to_thread(check_gateway)
     tail = clean_agent_output(r.stdout or '')[-200:]
     return {'ok': bool(up), 'gatewayUp': bool(up),
             'note': tail or ('网关已重启' if up else '网关未就绪，请查看 /tmp/easel-gateway.log')}
@@ -3035,6 +3038,9 @@ async def _run_harness_chat(req: ChatRequest, sk: str, message: str, runtime: st
             _save_turn(pk, "done", snapshot, {
                 "turn_id": turn_id, "runtime": runtime,
                 "clean_end": clean_end, "stop_reason": reason})
+        # 注意：claim 失败（锁被占/底座已切换）时刻意**不**落盘——保留上一轮的
+        # 结果快照不被失败轮覆盖（见 test_failed_ownership_check_does_not_overwrite_
+        # previous_result）；错误经 SSE 事件流（job log）回放可见。
         proc.finish()
         if _RUNNING_CHAT.get(sk) is proc:
             _RUNNING_CHAT.pop(sk, None)
@@ -3359,15 +3365,6 @@ async def api_chat_stream(req: ChatRequest):
                 q.put_nowait(SENTINEL)
                 hproc.finish()
 
-        _heal_openclaw_session(sk)       # 清洗历史里无签名 thinking 块，防回放失效
-        # 原始事件流由常驻 gateway 写到共享文件（见 SHARED_RAW_STREAM / scripts/gateway.sh），
-        # 不是 agent 客户端写的。本轮开始时记下文件当前尾偏移：只读此偏移之后追加的行，
-        # 再用首个新事件的 runId 闩锁本轮，隔离其它并发会话的事件。
-        try:
-            raw_start_offset = SHARED_RAW_STREAM.stat().st_size
-        except OSError:
-            raw_start_offset = 0
-
         cmd = openclaw_base_cmd() + [
             "--profile", OPENCLAW_PROFILE, "agent", "--agent", "main",
             "--session-key", f"agent:main:{sk}", "--session-id", _openclaw_session_id(sk),
@@ -3412,6 +3409,18 @@ async def api_chat_stream(req: ChatRequest):
             # Only the owner of both locks may replace the session snapshot.
             _save_turn(pk, "running", "", {"turn_id": turn_id})
             claimed = True
+
+            # 拿到两层锁之后再清洗历史：sanitize 是读-改-写，若与上一轮仍往同一
+            # transcript 追加的 openclaw 并发，会丢掉 heal 读到 replace 之间追加的行。
+            _heal_openclaw_session(sk)       # 清洗历史里无签名 thinking 块，防回放失效
+
+            # 原始事件流由常驻 gateway 写到共享文件（见 SHARED_RAW_STREAM / scripts/gateway.sh），
+            # 不是 agent 客户端写的。本轮开始时记下文件当前尾偏移：只读此偏移之后追加的行，
+            # 再用首个新事件的 runId 闩锁本轮，隔离其它并发会话的事件。
+            try:
+                raw_start_offset = SHARED_RAW_STREAM.stat().st_size
+            except OSError:
+                raw_start_offset = 0
 
             # Transport selection includes a blocking network probe; keep it
             # off the event loop. It cannot start an agent or acquire locks.
@@ -4164,11 +4173,27 @@ async def api_upload(
         ext = Path(name).suffix.lower()
         if ext not in UPLOAD_EXTS:
             raise HTTPException(400, f'不支持的文件类型：{ext or name}')
-        data = await f.read()
-        if len(data) > MAX_UPLOAD_MB * 1024 * 1024:
-            raise HTTPException(413, f'{name} 超过 {MAX_UPLOAD_MB}MB 上限')
+        # 分块流式落盘 + 边写边限：与 /api/upload/local 同样模式，避免先整读进内存
+        # （超限的多 GB 文件会把 web 进程撑爆）才报 413。
+        cap = MAX_UPLOAD_MB * 1024 * 1024
         target = _unique_upload_path(dest, name)
-        target.write_bytes(data)
+        size = 0
+        try:
+            with open(target, 'wb') as out:
+                while True:
+                    chunk = await f.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    size += len(chunk)
+                    if size > cap:
+                        raise HTTPException(413, f'{name} 超过 {MAX_UPLOAD_MB}MB 上限')
+                    out.write(chunk)
+        except HTTPException:
+            try:
+                target.unlink()
+            except OSError:
+                pass
+            raise
         rel = f"_inbox/{scope}/{batch}/{target.name}"
         saved.append({"id": _attachment_id(scope, rel), "name": target.name, "path": rel})
     if not saved:
@@ -4448,7 +4473,8 @@ async def api_save_credentials(platform: str, req: WechatCredentials):
     if not app_id or not app_secret:
         raise HTTPException(400, 'AppID 和 AppSecret 都不能为空')
     _wechat_save_credentials(app_id, app_secret, name=req.name.strip(), author=req.author.strip())
-    ok, msg = _wechat_verify_token()
+    # 验证要真连微信接口（最长 30s）：丢线程池，避免卡住整个事件循环
+    ok, msg = await asyncio.to_thread(_wechat_verify_token)
     with _WHOAMI_LOCK:
         _WHOAMI_CACHE.pop(platform, None)
     if ok:
@@ -4692,6 +4718,15 @@ async def api_logout(platform: str):
         with _WHOAMI_LOCK:
             _WHOAMI_CACHE.pop(platform, None)
         return {'ok': True, 'deleted': deleted}
+    proc = LOGIN_PROCESSES.pop(platform, None)
+    if proc is not None and proc.poll() is None:
+        # 与上面公众号分支同理：停掉仍在跑的登录进程，否则它会把 success 标记
+        # 又写回 {platform}.json，账号在退出后“复活”成已登录。
+        try:
+            proc.terminate()
+            await asyncio.to_thread(proc.wait, timeout=5)
+        except Exception:
+            pass
     prof_name = cfg.get('profile')
     if prof_name:
         pdir = (BROWSER_PROFILES / prof_name).resolve()
@@ -4892,6 +4927,7 @@ def _run_publish_bg(platform: str, cmd: list, title: str, body: str, cfg: dict,
                     status_file: Path, code_file: Path) -> None:
     """后台线程跑发布脚本（脚本自身把 starting/sms_required/verifying/success/error 写进 status_file）。
     结束后兜底补写终态 + 记 _publish.log + 成功则回流排期。"""
+    _SCHEDULE_LOCK = _schedule_lock()
     ok = False
     out = err = ''
     try:
@@ -4919,12 +4955,13 @@ def _run_publish_bg(platform: str, cmd: list, title: str, body: str, cfg: dict,
         pass
     if ok:
         try:
-            items = _read_schedule()
-            items.append({'id': uuid.uuid4().hex[:12], 'title': title,
-                          'date': time.strftime('%Y-%m-%d'), 'platform': cfg['name'],
-                          'time': time.strftime('%H:%M'), 'status': 'published', 'note': body[:200],
-                          'kind': 'content', 'source': 'publish-page'})
-            _write_schedule(items)
+            with _SCHEDULE_LOCK:
+                items = _read_schedule()
+                items.append({'id': uuid.uuid4().hex[:12], 'title': title,
+                              'date': time.strftime('%Y-%m-%d'), 'platform': cfg['name'],
+                              'time': time.strftime('%H:%M'), 'status': 'published', 'note': body[:200],
+                              'kind': 'content', 'source': 'publish-page'})
+                _write_schedule(items)
         except Exception:
             pass
 
@@ -5038,10 +5075,11 @@ async def api_publish(platform: str, req: PublishRequest):
         if extra_imgs:
             body_md += "\n\n" + "\n\n".join(f'![]({p})' for p in extra_imgs)
         md_path.write_text(f"# {title}\n\n{body_md}\n", encoding='utf-8')
-        conv = subprocess.run([py, str(WECHAT_SKILL_SCRIPTS / 'html_converter.py'),
-                               str(md_path), '-o', str(html_path)],
-                              cwd=str(PROJECT_ROOT), env=_proxy_env(),
-                              capture_output=True, text=True, timeout=60)
+        conv = await asyncio.to_thread(
+            subprocess.run, [py, str(WECHAT_SKILL_SCRIPTS / 'html_converter.py'),
+                             str(md_path), '-o', str(html_path)],
+            cwd=str(PROJECT_ROOT), env=_proxy_env(),
+            capture_output=True, text=True, timeout=60)
         if conv.returncode != 0 or not html_path.is_file():
             raise HTTPException(500, f"排版失败：{(conv.stderr or conv.stdout or '')[-200:]}")
         wx_proxy = os.environ.get('EASEL_PROXY') or os.environ.get('https_proxy') or ''
@@ -5075,12 +5113,15 @@ async def api_publish(platform: str, req: PublishRequest):
         pass
     if ok:
         try:
-            items = _read_schedule()
-            items.append({'id': uuid.uuid4().hex[:12], 'title': title,
-                          'date': time.strftime('%Y-%m-%d'), 'platform': cfg['name'],
-                          'time': time.strftime('%H:%M'), 'status': 'published',
-                          'note': req.body[:200], 'kind': 'content', 'source': 'publish-page'})
-            _write_schedule(items)
+            # 读-改-写加锁：与后台线程的异步发布回流（_run_publish_bg）并发时，
+            # 不加锁会互相覆盖丢记录。
+            with _schedule_lock():
+                items = _read_schedule()
+                items.append({'id': uuid.uuid4().hex[:12], 'title': title,
+                              'date': time.strftime('%Y-%m-%d'), 'platform': cfg['name'],
+                              'time': time.strftime('%H:%M'), 'status': 'published',
+                              'note': req.body[:200], 'kind': 'content', 'source': 'publish-page'})
+                _write_schedule(items)
         except Exception:
             pass
     return {'ok': ok, 'message': '发布成功' if ok else '发布失败（见 detail）', 'detail': detail}
@@ -5367,6 +5408,14 @@ SCHEDULE_FILE = OUTPUTS_DIR / "_schedule.json"
 SCHEDULE_STATUSES = {"idea", "draft", "scheduled", "published"}
 SCHEDULE_KINDS = {"content", "event"}
 
+# _schedule.json 读-改-写串行化：发布回流（后台线程 _run_publish_bg + 事件循环上的
+# api_publish 成功路径）与增删改端点并发时，不加锁会互相覆盖丢记录。
+_SCHEDULE_LOCK = threading.Lock()
+
+
+def _schedule_lock() -> threading.Lock:
+    return _SCHEDULE_LOCK
+
 
 def _read_schedule() -> list[dict]:
     if not SCHEDULE_FILE.is_file():
@@ -5468,8 +5517,10 @@ async def api_schedule_context(days: int = 14):
     cmd = [sys.executable, str(SHARED_SCRIPTS / "calendar_ops.py"),
            "--data", str(SCHEDULE_FILE), "context", "--days", str(max(1, min(days, 90)))]
     try:
-        proc = subprocess.run(cmd, cwd=str(PROJECT_ROOT), env=_proxy_env(),
-                              capture_output=True, text=True, timeout=20)
+        # 冷启动要起一个 Python 子进程（最长 20s）：丢线程池，避免卡住事件循环
+        proc = await asyncio.to_thread(
+            subprocess.run, cmd, cwd=str(PROJECT_ROOT), env=_proxy_env(),
+            capture_output=True, text=True, timeout=20)
         return json.loads(proc.stdout) if proc.returncode == 0 and proc.stdout.strip() else {}
     except Exception:
         return {}

@@ -261,7 +261,7 @@ class RPC:
             else:
                 try:
                     os.killpg(self.process.pid, signal.SIGTERM)
-                except ProcessLookupError:
+                except (ProcessLookupError, PermissionError):
                     pass
             try:
                 await asyncio.wait_for(self.process.wait(), 3)
@@ -271,13 +271,13 @@ class RPC:
                 else:
                     try:
                         os.killpg(self.process.pid, signal.SIGKILL)
-                    except ProcessLookupError:
+                    except (ProcessLookupError, PermissionError):
                         pass
                 await self.process.wait()
             if os.name != "nt":
                 try:
                     os.killpg(self.process.pid, signal.SIGKILL)
-                except ProcessLookupError:
+                except (ProcessLookupError, PermissionError):
                     pass
         for task in (self.reader, self.stderr):
             if task is not None:
