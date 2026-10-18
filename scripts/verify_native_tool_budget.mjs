@@ -134,11 +134,19 @@ export default {id:'easel-budget-fixture',register(api){api.registerTool(ctx=>({
   assert.equal(capability.timeoutMs, 8000);
   assert.equal(capability.requestAdmissionToken, false);
   assert.deepEqual(requests, { calls: 0, survivor: 0, thinking: 0 }, 'Capability probe must not execute an agent');
-  const send = label => callGatewayFromCli('chat.send', { timeout: '20000', json: true }, {
+  await assert.rejects(() => callGatewayFromCli('easel.toolBudget.send', { timeout: '10000', json: true }, {
+    instanceId: 'previous-gateway', maxCalls: 2, timeoutMs: 8000,
+    sessionKey: 'agent:main:rejected', message: 'must never reach the model', idempotencyKey: 'rejected-proof',
+  }, { progress: false }));
+  assert.deepEqual(requests, { calls: 0, survivor: 0, thinking: 0 });
+  const send = label => callGatewayFromCli('easel.toolBudget.send', { timeout: '20000', json: true }, {
+    instanceId: capability.instanceId, maxCalls: capability.maxCalls, timeoutMs: capability.timeoutMs,
     sessionKey: `agent:main:budget-${label}`, message: `EASEL_FIXTURE_${label}`,
     idempotencyKey: `fixture-${label}-${Date.now()}`,
   }, { progress: false });
-  await Promise.all([send('calls'), send('survivor')]);
+  const accepted = await Promise.all([send('calls'), send('survivor')]);
+  assert.ok(accepted.every(result => typeof result?.runId === 'string' && result.runId.length > 0),
+    'Guarded admission must return the core run identity for outcome inspection');
   await until(() => stopped('call_budget_exhausted') && events().some(event =>
     event.event === 'easel_budget_end' && event.stopReason === 'run_finished'));
   assert.ifError(fixtureError);
