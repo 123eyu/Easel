@@ -1036,7 +1036,9 @@ def check_gateway() -> bool:
     try:
         # 端口不能写死：Easel 用 --profile easel，OpenClaw 对非默认 profile 会走
         # 20000 + fnv1a32(profile) % 40000（easel → 37289），见 easel/gateway_endpoint.py。
-        with urllib.request.urlopen(healthz_url(), timeout=3) as response:
+        # 回环 healthz 探针不能继承 http_proxy；否则设置页会把健康的本机 gateway 误报离线。
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with opener.open(healthz_url(), timeout=3) as response:
             return response.status == 200
     except (OSError, urllib.error.URLError):
         return False
@@ -5454,58 +5456,61 @@ async def api_schedule_list():
 
 @app.post("/api/schedule")
 async def api_schedule_create(req: ScheduleItem):
-    items = _read_schedule()
-    kind = req.kind if req.kind in SCHEDULE_KINDS else "content"
-    st = req.status if req.status in SCHEDULE_STATUSES else "idea"
-    item = {
-        "id": uuid.uuid4().hex[:12],
-        "title": req.title.strip() or ("未命名活动" if kind == "event" else "未命名"),
-        "date": req.date,
-        "platform": req.platform,
-        "time": req.time,
-        "status": st,
-        "note": req.note,
-        "kind": kind,
-        "url": req.url,
-        "source": req.source if req.source in {"manual", "publish-page", "chat", "scheduler"} else "manual",
-        "event_type": req.event_type,
-        "end_date": req.end_date,
-    }
-    items.append(item)
-    _write_schedule(items)
+    with _schedule_lock():
+        items = _read_schedule()
+        kind = req.kind if req.kind in SCHEDULE_KINDS else "content"
+        st = req.status if req.status in SCHEDULE_STATUSES else "idea"
+        item = {
+            "id": uuid.uuid4().hex[:12],
+            "title": req.title.strip() or ("未命名活动" if kind == "event" else "未命名"),
+            "date": req.date,
+            "platform": req.platform,
+            "time": req.time,
+            "status": st,
+            "note": req.note,
+            "kind": kind,
+            "url": req.url,
+            "source": req.source if req.source in {"manual", "publish-page", "chat", "scheduler"} else "manual",
+            "event_type": req.event_type,
+            "end_date": req.end_date,
+        }
+        items.append(item)
+        _write_schedule(items)
     return item
 
 
 @app.put("/api/schedule/{sid}")
 async def api_schedule_update(sid: str, req: ScheduleItem):
-    items = _read_schedule()
-    for it in items:
-        if it.get("id") == sid:
-            kind = req.kind if req.kind in SCHEDULE_KINDS else it.get("kind", "content")
-            it.update({
-                "title": req.title.strip() or it.get("title", "未命名"),
-                "date": req.date,
-                "platform": req.platform,
-                "time": req.time,
-                "status": req.status if req.status in SCHEDULE_STATUSES else it.get("status", "idea"),
-                "note": req.note,
-                "kind": kind,
-                "url": req.url,
-                "event_type": req.event_type,
-                "end_date": req.end_date,
-            })
-            _write_schedule(items)
-            return it
+    with _schedule_lock():
+        items = _read_schedule()
+        for it in items:
+            if it.get("id") == sid:
+                kind = req.kind if req.kind in SCHEDULE_KINDS else it.get("kind", "content")
+                it.update({
+                    "title": req.title.strip() or it.get("title", "未命名"),
+                    "date": req.date,
+                    "platform": req.platform,
+                    "time": req.time,
+                    "status": req.status if req.status in SCHEDULE_STATUSES else it.get("status", "idea"),
+                    "note": req.note,
+                    "kind": kind,
+                    "url": req.url,
+                    "event_type": req.event_type,
+                    "end_date": req.end_date,
+                })
+                _write_schedule(items)
+                return it
     raise HTTPException(404, "排期不存在")
 
 
 @app.delete("/api/schedule/{sid}")
 async def api_schedule_delete(sid: str):
-    items = _read_schedule()
-    new = [it for it in items if it.get("id") != sid]
-    if len(new) == len(items):
-        raise HTTPException(404, "排期不存在")
-    _write_schedule(new)
+    with _schedule_lock():
+        items = _read_schedule()
+        new = [it for it in items if it.get("id") != sid]
+        if len(new) == len(items):
+            raise HTTPException(404, "排期不存在")
+        _write_schedule(new)
     return {"ok": True, "deleted": sid}
 
 

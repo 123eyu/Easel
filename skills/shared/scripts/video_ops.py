@@ -185,10 +185,10 @@ def _tsec(v: str) -> float:
     if len(parts) > 3:
         raise ValueError(v)
     secs = 0.0
-    for p in parts:
-        if not re.fullmatch(r"\d{1,6}(?:\.\d{1,3})?", p):
+    for part in parts:
+        if not re.fullmatch(r"\d+(?:\.\d+)?", part):
             raise ValueError(v)
-        secs = secs * 60 + float(p)
+        secs = secs * 60 + float(part)
     return secs
 
 

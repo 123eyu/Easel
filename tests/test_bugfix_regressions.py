@@ -96,7 +96,49 @@ def test_schedule_lock_is_a_shared_singleton():
     assert web._schedule_lock() is lock, "发布回流与增删改端点必须共用同一把锁"
 
 
-# ── doctor：healthz 回环探针不得走继承的 http_proxy ─────────────────────
+def test_schedule_write_endpoints_hold_shared_lock(monkeypatch):
+    class GuardedLock:
+        depth = 0
+
+        def __enter__(self):
+            self.depth += 1
+            return self
+
+        def __exit__(self, *args):
+            self.depth -= 1
+
+    lock = GuardedLock()
+    store = [{"id": "item-1", "title": "旧标题", "date": "2026-10-18", "kind": "content", "status": "idea"}]
+
+    def guarded_read():
+        assert lock.depth > 0, "读取排期参与 read-modify-write 时必须先持有共享锁"
+        return [dict(item) for item in store]
+
+    def guarded_write(items):
+        assert lock.depth > 0, "写入排期参与 read-modify-write 时必须先持有共享锁"
+        store[:] = [dict(item) for item in items]
+
+    monkeypatch.setattr(web, "_schedule_lock", lambda: lock)
+    monkeypatch.setattr(web, "_read_schedule", guarded_read)
+    monkeypatch.setattr(web, "_write_schedule", guarded_write)
+    monkeypatch.setattr(web.uuid, "uuid4", lambda: SimpleNamespace(hex="new-item-123456"))
+
+    created = asyncio.run(web.api_schedule_create(web.ScheduleItem(
+        title="新内容", date="2026-10-19", platform="xhs")))
+    assert created["id"] == "new-item-123"
+    assert [item["id"] for item in store] == ["item-1", "new-item-123"]
+
+    updated = asyncio.run(web.api_schedule_update("item-1", web.ScheduleItem(
+        title="新标题", date="2026-10-20", status="scheduled")))
+    assert updated["title"] == "新标题"
+    assert store[0]["status"] == "scheduled"
+
+    deleted = asyncio.run(web.api_schedule_delete("new-item-123"))
+    assert deleted == {"ok": True, "deleted": "new-item-123"}
+    assert [item["id"] for item in store] == ["item-1"]
+
+
+# ── gateway healthz：回环探针不得走继承的 http_proxy ────────────────────
 def test_gateway_healthz_bypasses_inherited_proxy(monkeypatch):
     from easel.commands import doctor
 
@@ -126,6 +168,10 @@ def test_gateway_healthz_bypasses_inherited_proxy(monkeypatch):
         monkeypatch.delenv("no_proxy", raising=False)
         monkeypatch.delenv("NO_PROXY", raising=False)
         assert doctor._gateway_healthy() is True
+
+        monkeypatch.setattr(web, "healthz_url",
+                             lambda: f"http://127.0.0.1:{port}/healthz")
+        assert web.check_gateway() is True
     finally:
         server.shutdown()
         server.server_close()
@@ -170,9 +216,12 @@ def test_video_tsec_parses_ffmpeg_time_forms():
     t = video_ops._tsec
     assert t("90") == 90.0
     assert t("90.5") == 90.5
+    assert t("1234567") == 1234567.0
+    assert t("1.2345") == 1.2345
     assert t("00:01:30") == 90.0
     assert t("1:30") == 90.0
     assert t("1:2:3.5") == 3723.5
+    assert t("1000000:00:00.123456") == 3600000000.123456
     for bad in ("", "1:2:3:4", "abc", "-5", "1:30:"):
         with pytest.raises(ValueError):
             t(bad)

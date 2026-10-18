@@ -142,7 +142,8 @@ export default function ProfilePage(props: ProfilePageProps) {
 function ProfileDetail({ persona, onDeleted, onBack, onUsePersona, inUse }: ProfilePageProps & {
   onBack: () => void;
   inUse: boolean;
-}) {  const [files, setFiles] = useState<PersonaFile[]>([]);
+}) {
+  const [files, setFiles] = useState<PersonaFile[]>([]);
   const [drafts, setDrafts] = useState<Record<string, string>>({});
   const [editing, setEditing] = useState(false);
   const [loading, setLoading] = useState(false);
