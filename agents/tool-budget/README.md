@@ -134,4 +134,3 @@ client must not cache it as permission for a later request, silently reconnect
 to another Gateway, or enable strict mode on the strength of this response
 alone. Atomic binding between verification and execution remains required for
 strict request admission.
-
