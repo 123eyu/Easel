@@ -290,7 +290,8 @@ def _make_shot_clip(shot: dict, dur: float, w: int, h: int, out: Path, workdir: 
         motion = str(shot.get("motion") or image_motion)
         # static 用于文字卡/slide/图表；Ken Burns 只用于适合裁切的照片。
         vf = _image_filter(motion, w, h, frames)
-        _run(["ffmpeg", "-y", "-loop", "1", "-i", src, *extra_inputs, "-t", f"{dur:.3f}",
+        # A corrupt looped image can retry forever without producing a frame.
+        _run(["ffmpeg", "-y", "-xerror", "-loop", "1", "-i", src, *extra_inputs, "-t", f"{dur:.3f}",
               "-vf", vf, *audio_out, "-c:v", "libx264", "-pix_fmt", "yuv420p", str(out)])
 
 
