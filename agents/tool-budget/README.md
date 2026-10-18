@@ -114,3 +114,24 @@ own temporary state and loopback ports; it never changes the user's profile.
 Only aggregate acceptance results go to stdout. Failed runs identify a local
 diagnostic directory. CI runs both direct tools and Tool Search on Linux and
 Windows; it does not upload raw gateway logs or transcripts.
+# Active process capability evidence
+
+The plugin registers the read-only Gateway RPC `easel.toolBudget.capability`
+after its execution hooks have registered. Supply a fresh 32–128 character
+lowercase hexadecimal `nonce`. The response echoes the nonce and includes a
+registration-specific `instanceId`, the pinned runtime version, immutable
+`maxCalls`/`timeoutMs`, and `durability: process_memory`. The method requires
+`operator.read` and the Gateway's normal profile authorization.
+
+The probe rejects unsupported runtime versions, disabled conversation hooks,
+disabled plugins, unavailable active configuration, and configuration that no
+longer matches the installed hooks. It neither runs a model nor executes tools.
+The native acceptance script checks this response before exercising the actual
+execution limits through the same isolated Gateway fixture.
+
+This is active registration evidence, **not a request admission token**. A
+client must not cache it as permission for a later request, silently reconnect
+to another Gateway, or enable strict mode on the strength of this response
+alone. Atomic binding between verification and execution remains required for
+strict request admission.
+

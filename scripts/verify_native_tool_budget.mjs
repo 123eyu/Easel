@@ -126,6 +126,14 @@ export default {id:'easel-budget-fixture',register(api){api.registerTool(ctx=>({
     } catch { return false; }
   }, 120000);
   const { callGatewayFromCli } = await import(pathToFileURL(path.join(runtime, 'dist/plugin-sdk/gateway-runtime.js')));
+  const capability = await callGatewayFromCli('easel.toolBudget.capability', { timeout: '10000', json: true },
+    { nonce: 'ab'.repeat(16) }, { progress: false });
+  assert.equal(capability.nonce, 'ab'.repeat(16));
+  assert.equal(capability.runtime, version);
+  assert.equal(capability.maxCalls, 2);
+  assert.equal(capability.timeoutMs, 8000);
+  assert.equal(capability.requestAdmissionToken, false);
+  assert.deepEqual(requests, { calls: 0, survivor: 0, thinking: 0 }, 'Capability probe must not execute an agent');
   const send = label => callGatewayFromCli('chat.send', { timeout: '20000', json: true }, {
     sessionKey: `agent:main:budget-${label}`, message: `EASEL_FIXTURE_${label}`,
     idempotencyKey: `fixture-${label}-${Date.now()}`,
