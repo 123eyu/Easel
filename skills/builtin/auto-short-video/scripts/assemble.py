@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import shutil
 import subprocess
@@ -250,7 +251,7 @@ def _make_shot_clip(shot: dict, dur: float, w: int, h: int, out: Path, workdir: 
         extra_inputs, audio_out = audio_args(src)
         if src_dur >= dur - 0.05 or src_dur <= 0:
             # 够长（或探测不到）→ 裁到 dur
-            _run(["ffmpeg", "-y", "-i", src, *extra_inputs, "-t", f"{dur:.3f}",
+            _run(["ffmpeg", "-y", "-xerror", "-i", src, *extra_inputs, "-t", f"{dur:.3f}",
                   "-vf", f"{base_vf},fps=30", *audio_out,
                   "-c:v", "libx264", "-pix_fmt", "yuv420p", str(out)])
             return
@@ -269,16 +270,16 @@ def _make_shot_clip(shot: dict, dur: float, w: int, h: int, out: Path, workdir: 
             mode = "stretch" if factor <= MAX_STRETCH else "loop"
         if mode == "stretch":
             # 慢放：拉伸 PTS 到 dur，画面持续运动、无跳变、无停顿
-            _run(["ffmpeg", "-y", "-i", src,
+            _run(["ffmpeg", "-y", "-xerror", "-i", src,
                   *extra_inputs, "-vf", f"{base_vf},setpts={factor:.4f}*PTS,fps=30", "-t", f"{dur:.3f}",
                   *audio_out, "-c:v", "libx264", "-pix_fmt", "yuv420p", str(out)])
         elif mode == "freeze":
             # 冻结末帧（旧行为，仅当显式要求）
-            _run(["ffmpeg", "-y", "-i", src,
+            _run(["ffmpeg", "-y", "-xerror", "-i", src,
                   *extra_inputs, "-vf", f"{base_vf},fps=30,tpad=stop_mode=clone:stop_duration={dur:.3f}",
                   "-t", f"{dur:.3f}", *audio_out, "-c:v", "libx264", "-pix_fmt", "yuv420p", str(out)])
         else:  # loop：循环填满，画面持续运动（循环点有轻微跳变）
-            _run(["ffmpeg", "-y", "-stream_loop", "-1", "-i", src, *extra_inputs, "-t", f"{dur:.3f}",
+            _run(["ffmpeg", "-y", "-xerror", "-stream_loop", "-1", "-i", src, *extra_inputs, "-t", f"{dur:.3f}",
                   "-vf", f"{base_vf},fps=30", *audio_out,
                   "-c:v", "libx264", "-pix_fmt", "yuv420p", str(out)])
     else:
@@ -293,6 +294,30 @@ def _make_shot_clip(shot: dict, dur: float, w: int, h: int, out: Path, workdir: 
         # A corrupt looped image can retry forever without producing a frame.
         _run(["ffmpeg", "-y", "-xerror", "-loop", "1", "-i", src, *extra_inputs, "-t", f"{dur:.3f}",
               "-vf", vf, *audio_out, "-c:v", "libx264", "-pix_fmt", "yuv420p", str(out)])
+
+
+def _validate_shot_clip(path: Path, duration: float, width: int, height: int):
+    result = subprocess.run([
+        "ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
+        "stream=duration,width,height", "-of", "json", str(path),
+    ], capture_output=True, text=True)
+    try:
+        stream = json.loads(result.stdout)["streams"][0]
+        actual_duration = float(stream["duration"])
+        valid = (result.returncode == 0 and not result.stderr.strip()
+                 and math.isfinite(actual_duration) and actual_duration > 0
+                 and abs(actual_duration - duration) <= 2 / 30 + 0.001
+                 and stream["width"] == width and stream["height"] == height)
+    except (ValueError, KeyError, IndexError, TypeError):
+        valid = False
+    if not valid:
+        raise CheckpointError("Rendered shot is incomplete or has unexpected video properties")
+    decoded = subprocess.run([
+        "ffmpeg", "-v", "error", "-xerror", "-i", str(path), "-map", "0:v:0",
+        "-f", "null", "-",
+    ], capture_output=True, text=True)
+    if decoded.returncode != 0 or decoded.stderr.strip():
+        raise CheckpointError("Rendered shot cannot be decoded completely")
 
 
 def _renderer_identity() -> dict:
@@ -367,15 +392,21 @@ def cmd_assemble(args) -> int:
         for i, (shot, dur) in enumerate(zip(shots, durations)):
             clip = workdir / f"clip_{i:03d}.mp4"
             print(f"  合成分镜 {i+1}/{len(shots)}（{dur:.1f}s）...", file=sys.stderr)
+            render_shot = shot
+            if cache is not None:
+                source_key = "video" if shot.get("video") else "image"
+                source = Path(shot.get(source_key) or "").resolve()
+                render_shot = {**shot, source_key: str(source)}
             def render(target):
-                _make_shot_clip(shot, dur, w, h, target, workdir, pad_mode,
+                _make_shot_clip(render_shot, dur, w, h, target, workdir, pad_mode,
                                 include_audio=native_audio,
                                 preserve_audio=keeps_audio[i],
                                 image_motion=image_motion)
+                if cache is not None:
+                    _validate_shot_clip(target, dur, w, h)
             if cache is None:
                 render(clip)
             else:
-                source = Path(shot.get("video") or shot.get("image") or "").resolve()
                 parameters = {"renderer": renderer, "source": str(source),
                               "kind": "video" if shot.get("video") else "image",
                               "duration": dur, "width": w, "height": h, "pad_mode": pad_mode,

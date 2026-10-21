@@ -5,6 +5,32 @@ import { installBudgetHooks } from '../../agents/tool-budget/hooks.mjs';
 const context = { agentId: 'fixture', sessionKey: 'session-private', runId: 'run-private' };
 const drain = () => new Promise(resolve => setImmediate(resolve));
 
+for (const pluginConfig of [undefined, null, {}]) {
+  test(`unconfigured budgets register no restrictions or deadline: ${JSON.stringify(pluginConfig)}`, () => {
+    const hooks = [], timers = [], stops = [];
+    const policy = installBudgetHooks({ pluginConfig,
+      on: (...args) => hooks.push(args), logger: { info() {} } }, {
+      clock: () => { throw Error('An unlimited run needs no budget clock'); },
+      schedule: (...args) => timers.push(args),
+      stop: (...args) => stops.push(args),
+    });
+    assert.equal(policy, null);
+    assert.deepEqual(hooks, []);
+    assert.deepEqual(timers, []);
+    assert.deepEqual(stops, []);
+  });
+}
+
+for (const pluginConfig of [{ maxCalls: 2 }, { timeoutMs: 100 },
+  { maxCalls: -1, timeoutMs: 100 }, { maxCalls: 2, timeoutMs: 0 }]) {
+  test(`explicit incomplete or invalid limits fail before registering hooks: ${JSON.stringify(pluginConfig)}`, () => {
+    const hooks = [];
+    assert.throws(() => installBudgetHooks({ pluginConfig,
+      on: (...args) => hooks.push(args) }, { stop() {} }), TypeError);
+    assert.deepEqual(hooks, []);
+  });
+}
+
 test('registered policy remains the policy enforced by later runs', () => {
   const pluginConfig = { maxCalls: 1, timeoutMs: 100 };
   const hooks = {};

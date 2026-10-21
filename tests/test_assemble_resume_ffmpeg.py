@@ -52,3 +52,51 @@ def test_real_image_assembly_reuses_verified_shots(tmp_path, recover_failure):
                             "-of", "json", str(final)], capture_output=True, text=True, timeout=10)
     assert probe.returncode == 0, probe.stderr
     assert 0.3 <= float(json.loads(probe.stdout)["format"]["duration"]) <= 0.6
+
+
+@pytest.mark.skipif(not (shutil.which("ffmpeg") and shutil.which("ffprobe")),
+                    reason="real-media smoke test requires ffmpeg and ffprobe")
+def test_corrupt_video_preserves_delivery_and_never_commits_shortened_shot(tmp_path):
+    script = Path(__file__).resolve().parents[1] / "skills/builtin/auto-short-video/scripts/assemble.py"
+    project = tmp_path / "outputs" / "damaged-video"
+    project.mkdir(parents=True)
+    source = project / "source.mp4"
+    subprocess.run([
+        "ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i",
+        "testsrc2=size=160x160:rate=30:duration=2", "-c:v", "libx264", "-g", "60",
+        "-pix_fmt", "yuv420p", str(source),
+    ], check=True, timeout=20)
+    valid_source = source.read_bytes()
+    probe = subprocess.run([
+        "ffprobe", "-v", "error", "-select_streams", "v", "-show_packets",
+        "-of", "json", str(source),
+    ], capture_output=True, text=True, check=True, timeout=10)
+    damaged = bytearray(valid_source)
+    for packet in json.loads(probe.stdout)["packets"][20:]:
+        offset = int(packet["pos"])
+        size = int(packet["size"])
+        damaged[offset:offset + size] = bytes(size)
+    source.write_bytes(damaged)
+    storyboard = project / "storyboard.json"
+    storyboard.write_text(json.dumps({"size": "160x160", "shots": [
+        {"video": str(source), "duration": 2},
+    ]}), encoding="utf-8")
+    final = project / "final.mp4"
+    final.write_bytes(b"previous complete delivery")
+    command = [sys.executable, str(script), "assemble", "--resume",
+               "--storyboard", str(storyboard), "-o", str(final)]
+    env = {**os.environ, "EASEL_ROOT": str(tmp_path), "PYTHONUTF8": "1"}
+    manifest = project / ".final.mp4.checkpoints" / "checkpoints.json"
+    for _ in range(2):
+        result = subprocess.run(command, env=env, capture_output=True, timeout=30)
+        assert result.returncode != 0
+        assert final.read_bytes() == b"previous complete delivery"
+        assert not manifest.exists()
+    source.write_bytes(valid_source)
+    repaired = subprocess.run(command, env=env, capture_output=True, timeout=30)
+    assert repaired.returncode == 0, repaired.stderr
+    probe = subprocess.run([
+        "ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
+        "stream=duration", "-of", "json", str(final),
+    ], capture_output=True, text=True, check=True, timeout=10)
+    assert abs(float(json.loads(probe.stdout)["streams"][0]["duration"]) - 2) < 0.07

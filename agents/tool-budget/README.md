@@ -13,7 +13,12 @@ parallel dispatcher burst can exhaust capacity before its targets begin. Limits
 are conservative and are not a count of external API requests.
 
 The plugin is optional; installing Easel does not enable it or alter existing
-OpenClaw settings. It does not cover Codex or ACP backends, CLI child processes,
+OpenClaw settings. **By default, Easel adds no tool-call count or total runtime
+limit.** Loading this plugin with no `config` or an empty `{}` also registers no
+budget hooks, deadline timers, capability method, or guarded submission method.
+Only explicitly configuring both limits activates enforcement. Existing native
+gateway timeouts and unrelated safety policies remain unchanged.
+It does not cover Codex or ACP backends, CLI child processes,
 or external side effects performed inside one admitted tool.
 
 ## Configuration
@@ -43,8 +48,13 @@ configuration; do not replace the entire config with this fragment.
 }
 ```
 
+The `40` calls and `120000` ms above are an **opt-in example, not defaults**.
+Omit `config` or use `"config": {}` to leave both limits disabled. To enable
+budget enforcement, provide both `maxCalls` and `timeoutMs`; partial or invalid
+configuration is rejected rather than silently disabling protection.
 `maxCalls` must be an integer from 0 to 10000; `timeoutMs` must be an integer
-from 1 to 3600000. There are no implicit unlimited defaults. Missing/invalid
+from 1 to 3600000. With enforcement enabled, `maxCalls: 0` denies all tools; it
+does not mean unlimited. Missing/invalid
 run or call identities deny execution. Lifecycle hooks need OpenClaw's
 `allowConversationAccess` setting; this plugin does not read or log messages,
 tool parameters, or results. Without that setting, OpenClaw blocks those hooks
@@ -107,6 +117,7 @@ credentials or model service. Run it with the pinned Node version:
 npm install --prefix /tmp/easel-budget-runtime --ignore-scripts openclaw@2026.10.2
 node scripts/verify_native_tool_budget.mjs /tmp/easel-budget-runtime/node_modules/openclaw
 node scripts/verify_native_tool_budget.mjs /tmp/easel-budget-runtime/node_modules/openclaw --tool-search
+node scripts/verify_native_tool_budget.mjs /tmp/easel-budget-runtime/node_modules/openclaw --unlimited
 ```
 
 Use an equivalent temporary directory on Windows. Each invocation creates its
@@ -114,6 +125,9 @@ own temporary state and loopback ports; it never changes the user's profile.
 Only aggregate acceptance results go to stdout. Failed runs identify a local
 diagnostic directory. CI runs both direct tools and Tool Search on Linux and
 Windows; it does not upload raw gateway logs or transcripts.
+The `--unlimited` check loads the plugin with an empty configuration, verifies
+that five direct tools run and a model response outlasts the opt-in example's
+deadline, and confirms no budget lifecycle hooks or capability RPC are active.
 
 ## Active process capability evidence
 

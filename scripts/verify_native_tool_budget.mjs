@@ -10,8 +10,9 @@ import { stripVTControlCharacters } from 'node:util';
 
 const runtime = path.resolve(process.argv[2] ?? 'node_modules/openclaw');
 const toolSearch = process.argv.includes('--tool-search');
+const unlimited = process.argv.includes('--unlimited');
 // Tool Search exposes both the dispatcher and target to native tool hooks.
-const expectedEffects = toolSearch ? 1 : 2;
+const expectedEffects = unlimited ? (toolSearch ? 1 : 5) : toolSearch ? 1 : 2;
 const version = JSON.parse(fs.readFileSync(path.join(runtime, 'package.json'), 'utf8')).version;
 assert.equal(version, '2026.10.2', 'Use the pinned acceptance runtime; revalidate other versions separately');
 const plugin = fileURLToPath(new URL('../agents/tool-budget', import.meta.url));
@@ -54,12 +55,22 @@ const server = http.createServer(async (req, res) => {
     chunk({ role: 'assistant' });
     if (label === 'thinking') {
       res.once('close', () => { thinkingClosed = true; });
+      if (unlimited) {
+        await sleep(9000);
+        assert.equal(res.destroyed, false, 'Unconfigured budget cancelled the model');
+        chunk({ content: 'Completed beyond the opt-in deadline.' });
+        chunk({}, 'stop');
+        res.end('data: [DONE]\n\n');
+      }
       return; // Hold the response open until the native deadline cancels it.
     }
     if (label === 'survivor') {
-      await until(() => stopped('call_budget_exhausted'));
+      await until(() => unlimited ? requests.calls >= 2 : stopped('call_budget_exhausted'));
       assert.equal(res.destroyed, false, 'Stopping another run cancelled the survivor');
       chunk({ content: 'Survivor completed after the other run stopped.' });
+      chunk({}, 'stop');
+    } else if (unlimited && requests.calls > 1) {
+      chunk({ content: 'All unbudgeted tools completed.' });
       chunk({}, 'stop');
     } else {
       await until(() => requests.survivor > 0);
@@ -103,7 +114,8 @@ export default {id:'easel-budget-fixture',register(api){api.registerTool(ctx=>({
       cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } }] } } },
   tools: { allow: ['budget_fixture'], toolSearch },
   plugins: { allow: ['easel-tool-budget', 'easel-budget-fixture'], load: { paths: [plugin, fixture] }, entries: {
-    'easel-tool-budget': { enabled: true, hooks: { allowConversationAccess: true }, config: { maxCalls: 2, timeoutMs: 8000 } },
+    'easel-tool-budget': { enabled: true, hooks: { allowConversationAccess: true },
+      config: unlimited ? {} : { maxCalls: 2, timeoutMs: 8000 } },
     'easel-budget-fixture': { enabled: true }, 'memory-core': { enabled: false },
   } }, cron: { enabled: false }, update: { checkOnStart: false } };
   fs.writeFileSync(path.join(root, 'openclaw.json'), JSON.stringify(config));
@@ -126,45 +138,67 @@ export default {id:'easel-budget-fixture',register(api){api.registerTool(ctx=>({
     } catch { return false; }
   }, 120000);
   const { callGatewayFromCli } = await import(pathToFileURL(path.join(runtime, 'dist/plugin-sdk/gateway-runtime.js')));
-  const capability = await callGatewayFromCli('easel.toolBudget.capability', { timeout: '10000', json: true },
-    { nonce: 'ab'.repeat(16) }, { progress: false });
-  assert.equal(capability.nonce, 'ab'.repeat(16));
-  assert.equal(capability.runtime, version);
-  assert.equal(capability.maxCalls, 2);
-  assert.equal(capability.timeoutMs, 8000);
-  assert.equal(capability.requestAdmissionToken, false);
-  assert.deepEqual(requests, { calls: 0, survivor: 0, thinking: 0 }, 'Capability probe must not execute an agent');
-  await assert.rejects(() => callGatewayFromCli('easel.toolBudget.send', { timeout: '10000', json: true }, {
-    instanceId: 'previous-gateway', maxCalls: 2, timeoutMs: 8000,
-    sessionKey: 'agent:main:rejected', message: 'must never reach the model', idempotencyKey: 'rejected-proof',
-  }, { progress: false }));
-  assert.deepEqual(requests, { calls: 0, survivor: 0, thinking: 0 });
-  const send = label => callGatewayFromCli('easel.toolBudget.send', { timeout: '20000', json: true }, {
-    instanceId: capability.instanceId, maxCalls: capability.maxCalls, timeoutMs: capability.timeoutMs,
-    sessionKey: `agent:main:budget-${label}`, message: `EASEL_FIXTURE_${label}`,
-    idempotencyKey: `fixture-${label}-${Date.now()}`,
-  }, { progress: false });
-  const accepted = await Promise.all([send('calls'), send('survivor')]);
-  assert.ok(accepted.every(result => typeof result?.runId === 'string' && result.runId.length > 0),
-    'Guarded admission must return the core run identity for outcome inspection');
-  await until(() => stopped('call_budget_exhausted') && events().some(event =>
-    event.event === 'easel_budget_end' && event.stopReason === 'run_finished'));
-  assert.ifError(fixtureError);
-  const effects = fs.readFileSync(effectsPath, 'utf8').trim().split('\n').map(line => JSON.parse(line));
-  assert.equal(effects.length, expectedEffects, 'Native effects must match admitted dispatch depth');
-  assert.ok(effects.every(effect => effect.session === 'agent:main:budget-calls'));
-  assert.equal(requests.survivor, 1);
-  const countAfterStop = requests.calls;
-  await send('thinking');
-  await until(() => stopped('time_budget_exhausted') && thinkingClosed);
-  assert.ifError(fixtureError);
-  await sleep(1000);
-  assert.equal(requests.calls, countAfterStop, 'Cancelled model continued requesting tools');
-  assert.equal(requests.thinking, 1, 'Deadline cancellation retried the model');
-  assert.equal(fs.readFileSync(effectsPath, 'utf8').trim().split('\n').length, expectedEffects);
-  assert.equal(events().filter(event => event.event === 'easel_budget_stop').length, 2);
-  console.log(JSON.stringify({ runtime: version, toolSearch, complete: true, toolEffects: effects.length,
-    callStopConfirmed: true, deadlineStopConfirmed: true, concurrentRunCompleted: true, modelRequests: requests }));
+  if (unlimited) {
+    await assert.rejects(() => callGatewayFromCli('easel.toolBudget.capability', { timeout: '10000', json: true },
+      { nonce: 'ab'.repeat(16) }, { progress: false }));
+    const send = label => callGatewayFromCli('chat.send', { timeout: '20000', json: true }, {
+      sessionKey: `agent:main:budget-${label}`, message: `EASEL_FIXTURE_${label}`,
+      idempotencyKey: `fixture-${label}-${Date.now()}`,
+    }, { progress: false });
+    await Promise.all([send('calls'), send('survivor')]);
+    await until(() => requests.calls >= 2);
+    assert.ifError(fixtureError);
+    const effects = fs.readFileSync(effectsPath, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+    assert.equal(effects.length, expectedEffects);
+    assert.ok(effects.every(effect => effect.session === 'agent:main:budget-calls'));
+    await send('thinking');
+    await until(() => thinkingClosed, 15000);
+    assert.ifError(fixtureError);
+    assert.equal(requests.thinking, 1);
+    assert.deepEqual(events(), [], 'Unconfigured plugin emitted budget lifecycle events');
+    console.log(JSON.stringify({ runtime: version, toolSearch, unlimited: true, complete: true,
+      toolEffects: effects.length, noBudgetDeadline: true, noBudgetHooks: true, modelRequests: requests }));
+  } else {
+    const capability = await callGatewayFromCli('easel.toolBudget.capability', { timeout: '10000', json: true },
+      { nonce: 'ab'.repeat(16) }, { progress: false });
+    assert.equal(capability.nonce, 'ab'.repeat(16));
+    assert.equal(capability.runtime, version);
+    assert.equal(capability.maxCalls, 2);
+    assert.equal(capability.timeoutMs, 8000);
+    assert.equal(capability.requestAdmissionToken, false);
+    assert.deepEqual(requests, { calls: 0, survivor: 0, thinking: 0 }, 'Capability probe must not execute an agent');
+    await assert.rejects(() => callGatewayFromCli('easel.toolBudget.send', { timeout: '10000', json: true }, {
+      instanceId: 'previous-gateway', maxCalls: 2, timeoutMs: 8000,
+      sessionKey: 'agent:main:rejected', message: 'must never reach the model', idempotencyKey: 'rejected-proof',
+    }, { progress: false }));
+    assert.deepEqual(requests, { calls: 0, survivor: 0, thinking: 0 });
+    const send = label => callGatewayFromCli('easel.toolBudget.send', { timeout: '20000', json: true }, {
+      instanceId: capability.instanceId, maxCalls: capability.maxCalls, timeoutMs: capability.timeoutMs,
+      sessionKey: `agent:main:budget-${label}`, message: `EASEL_FIXTURE_${label}`,
+      idempotencyKey: `fixture-${label}-${Date.now()}`,
+    }, { progress: false });
+    const accepted = await Promise.all([send('calls'), send('survivor')]);
+    assert.ok(accepted.every(result => typeof result?.runId === 'string' && result.runId.length > 0),
+      'Guarded admission must return the core run identity for outcome inspection');
+    await until(() => stopped('call_budget_exhausted') && events().some(event =>
+      event.event === 'easel_budget_end' && event.stopReason === 'run_finished'));
+    assert.ifError(fixtureError);
+    const effects = fs.readFileSync(effectsPath, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+    assert.equal(effects.length, expectedEffects, 'Native effects must match admitted dispatch depth');
+    assert.ok(effects.every(effect => effect.session === 'agent:main:budget-calls'));
+    assert.equal(requests.survivor, 1);
+    const countAfterStop = requests.calls;
+    await send('thinking');
+    await until(() => stopped('time_budget_exhausted') && thinkingClosed);
+    assert.ifError(fixtureError);
+    await sleep(1000);
+    assert.equal(requests.calls, countAfterStop, 'Cancelled model continued requesting tools');
+    assert.equal(requests.thinking, 1, 'Deadline cancellation retried the model');
+    assert.equal(fs.readFileSync(effectsPath, 'utf8').trim().split('\n').length, expectedEffects);
+    assert.equal(events().filter(event => event.event === 'easel_budget_stop').length, 2);
+    console.log(JSON.stringify({ runtime: version, toolSearch, complete: true, toolEffects: effects.length,
+      callStopConfirmed: true, deadlineStopConfirmed: true, concurrentRunCompleted: true, modelRequests: requests }));
+  }
 } catch (error) {
   console.error(`Native budget acceptance failed; isolated diagnostics: ${root}`);
   // Startup phase names are useful on slow CI hosts and contain no config/input.

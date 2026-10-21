@@ -3,6 +3,7 @@ import argparse
 import importlib.util
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -17,6 +18,7 @@ def assembly(tmp_path, monkeypatch):
     monkeypatch.setitem(module.validate_output_path.__globals__, "OUTPUTS_DIR", tmp_path / "outputs")
     monkeypatch.setattr(module, "_check_ffmpeg", lambda: None)
     monkeypatch.setattr(module, "_renderer_identity", lambda: {"version": "test renderer 1"})
+    monkeypatch.setattr(module, "_validate_shot_clip", lambda *args: None)
     # Fake ffmpeg only materializes local outputs; cache/locks/files are real.
     monkeypatch.setattr(module, "_run", lambda cmd: Path(cmd[-1]).write_bytes(b"assembled video"))
     root = tmp_path / "outputs" / "恢复演示"
@@ -148,3 +150,64 @@ def test_competing_assembly_fails_without_touching_output(assembly):
         with pytest.raises(module.CheckpointError, match="lock"):
             module.cmd_assemble(args)
     assert not calls and Path(args.output).read_bytes() == b"old final"
+
+
+def test_invalid_render_never_commits_checkpoint_or_replaces_delivery(assembly, monkeypatch):
+    module, args, images, calls = assembly
+    final = Path(args.output)
+    final.write_bytes(b"old complete delivery")
+    def reject(*args):
+        raise module.CheckpointError("incomplete video")
+    monkeypatch.setattr(module, "_validate_shot_clip", reject)
+    with pytest.raises(module.CheckpointError, match="incomplete"):
+        module.cmd_assemble(args)
+    assert final.read_bytes() == b"old complete delivery"
+    assert not (final.parent / ".final.mp4.checkpoints" / "checkpoints.json").exists()
+
+
+def test_symlink_swap_renders_the_same_source_that_was_fingerprinted(assembly, monkeypatch):
+    module, args, images, calls = assembly
+    link = images[0].with_name("linked.png")
+    try:
+        link.symlink_to(images[0])
+    except OSError:
+        pytest.skip("symlink creation is unavailable")
+    storyboard = Path(args.storyboard)
+    data = json.loads(storyboard.read_text(encoding="utf-8"))
+    data["shots"] = [{"image": str(link), "duration": 1}]
+    storyboard.write_text(json.dumps(data), encoding="utf-8")
+    rendered = []
+    def render(shot, duration, width, height, output, *args, **kwargs):
+        link.unlink()
+        link.symlink_to(images[1])
+        content = Path(shot["image"]).read_bytes()
+        rendered.append(content)
+        output.write_bytes(content + b" rendered")
+    monkeypatch.setattr(module, "_make_shot_clip", render)
+    assert module.cmd_assemble(args) == 0
+    assert rendered == [images[0].read_bytes()]
+    link.unlink()
+    link.symlink_to(images[0])
+    assert module.cmd_assemble(args) == 0
+    assert rendered == [images[0].read_bytes()]
+
+
+@pytest.mark.parametrize("invalid", ["short", "missing-stream", "wrong-size", "decode"])
+def test_shot_validation_rejects_invalid_video_properties(tmp_path, monkeypatch, invalid):
+    path = Path(__file__).resolve().parents[1] / "skills/builtin/auto-short-video/scripts/assemble.py"
+    spec = importlib.util.spec_from_file_location("validation_assemble", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    stream = {"duration": "2", "width": 320, "height": 568}
+    if invalid == "short":
+        stream["duration"] = "0.7"
+    if invalid == "wrong-size":
+        stream["width"] = 160
+    payload = {"streams": [] if invalid == "missing-stream" else [stream]}
+    def run(command, **kwargs):
+        if command[0] == "ffprobe":
+            return SimpleNamespace(returncode=0, stdout=json.dumps(payload), stderr="")
+        return SimpleNamespace(returncode=1, stdout="", stderr="decode error")
+    monkeypatch.setattr(module.subprocess, "run", run)
+    with pytest.raises(module.CheckpointError):
+        module._validate_shot_clip(tmp_path / "clip.mp4", 2, 320, 568)

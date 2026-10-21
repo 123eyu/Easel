@@ -36,3 +36,6 @@ jobs:
       - name: Verify native Tool Search uses the same budget
         shell: bash
         run: node scripts/verify_native_tool_budget.mjs "$RUNNER_TEMP/budget-runtime/node_modules/openclaw" --tool-search
+      - name: Verify unconfigured plugin leaves calls and runtime unrestricted
+        shell: bash
+        run: node scripts/verify_native_tool_budget.mjs "$RUNNER_TEMP/budget-runtime/node_modules/openclaw" --unlimited

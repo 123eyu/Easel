@@ -10,6 +10,7 @@ export default {
   register(api) {
     const policy = installBudgetHooks(api, { stop: params => callGatewayFromCli('chat.abort',
       { timeout: '5000', json: true }, params, { progress: false }) });
+    if (policy === null) return;
     const instanceId = registerBudgetCapability(api, policy);
     registerBudgetSend(api, policy, instanceId, dispatchGatewayMethod);
   },
