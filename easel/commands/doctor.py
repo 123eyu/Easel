@@ -353,6 +353,73 @@ def _tool_loop_policy() -> list[str]:
     return lines
 
 
+# OpenClaw 的压缩阈值 = 声明的 contextWindow − reserveTokens，其中
+# reserveTokens = min(20_000, contextWindow × 0.25)
+#（DEFAULT_COMPACTION_SETTINGS.reserveTokens = 16_384，先抬到下限 20_000，再按 25% 封顶）
+#
+# 声明值越大，阈值越高，上下文压缩越晚触发；而上下文越长，provider 侧 prefix cache
+# 越容易失效并重发整段未缓存输入。声明值填错还有更直接的后果：OpenClaw 会用它在本地
+# 校验请求预算，超了就直接拒发（"Context window exceeded"），根本到不了 provider。
+_COMPACTION_RESERVE_FLOOR = 20_000
+_COMPACTION_RESERVE_RATIO = 0.25
+
+
+def _compaction_threshold(context_window: int) -> int:
+    """返回声明窗口对应的压缩阈值（token）。"""
+    reserve = min(_COMPACTION_RESERVE_FLOOR, int(context_window * _COMPACTION_RESERVE_RATIO))
+    return context_window - reserve
+
+
+def _context_budget_policy() -> list[str]:
+    """描述已保存的上下文预算配置；不改配置，也不假设运行时已加载。"""
+    try:
+        cfg = json.loads(_openclaw_config_path().read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return ["无法读取 JSON 配置；上下文预算状态未知"]
+    if not isinstance(cfg, dict):
+        return ["配置根节点不是对象；上下文预算状态未知"]
+
+    lines: list[str] = []
+    models = cfg.get("models")
+    providers = models.get("providers") if isinstance(models, dict) else None
+    if not isinstance(providers, dict):
+        lines.append("models.providers 未设置；无法计算压缩阈值")
+    else:
+        for provider, spec in sorted(providers.items()):
+            if not isinstance(spec, dict):
+                lines.append(f"{provider}：格式异常；无法计算压缩阈值")
+                continue
+            entries = spec.get("models")
+            if not isinstance(entries, list):
+                continue
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    continue
+                model_id = str(entry.get("id") or "?")
+                window = entry.get("contextWindow")
+                if isinstance(window, bool) or not isinstance(window, int) or window <= 0:
+                    lines.append(f"{provider}/{model_id}：未声明 contextWindow；阈值由 OpenClaw 推导")
+                    continue
+                lines.append(
+                    f"{provider}/{model_id}：声明 {window:,} → 压缩阈值约 {_compaction_threshold(window):,}"
+                )
+
+    skills = cfg.get("skills")
+    limits = skills.get("limits") if isinstance(skills, dict) else None
+    if not isinstance(limits, dict):
+        lines.append("skills.limits：未设置（技能目录预算走 OpenClaw 默认值）")
+    else:
+        chars = limits.get("maxSkillsPromptChars")
+        count = limits.get("maxSkillsInPrompt")
+        described = []
+        if isinstance(chars, int) and not isinstance(chars, bool):
+            described.append(f"maxSkillsPromptChars={chars:,}")
+        if isinstance(count, int) and not isinstance(count, bool):
+            described.append(f"maxSkillsInPrompt={count}")
+        lines.append("skills.limits：已设置 " + ("，".join(described) if described else "（无可识别字段）"))
+    return lines
+
+
 def cmd_doctor(_args) -> int:
     print("Easel — 环境检查\n")
     all_ok = True
@@ -445,6 +512,11 @@ def cmd_doctor(_args) -> int:
             print(f"    └─ {line}")
         print("    未设置不等于关闭；继承、默认值和运行时支持由 OpenClaw 版本决定。")
         print("    已保存配置不证明网关已加载，也不代表每任务工具调用预算。")
+        print("  OpenClaw 上下文预算（只读配置诊断，不计入环境就绪结果）")
+        for line in _context_budget_policy():
+            print(f"    └─ {line}")
+        print("    声明的 contextWindow 决定压缩阈值，也会用于本地请求预算校验。")
+        print("    声明值越大越晚压缩；上下文越长，provider 侧 prefix cache 越易失效并整段重发。")
         # .env 填了 ≠ setup 真的把 provider 写进了 openclaw；不对账就会「doctor 全绿但对话报错」。
         route_ok, route_detail = _primary_model_routable()
         all_ok &= _check("OpenClaw model routing", route_ok, route_detail)
