@@ -956,18 +956,36 @@ PY
 elif [ "$STANDARD_LLM_CONFIGURED" = false ] && usable_key "${GEMINI_MAAS_API_KEY:-}"; then
     GEMINI_PROVIDER="rednote-gemini"
     GEMINI_MODEL="${GEMINI_MAAS_MODEL:-gemini-3.1-pro-preview}"
-    # 声明的 contextWindow 不只是描述模型能力：OpenClaw 用它推导压缩阈值
-    # （窗口 − min(20_000, 窗口×25%)），也用它做本地请求预算校验——声明过小会直接
-    # 拒发请求，声明过大则压缩长期不触发、上下文越滚越长、provider 侧 prefix cache
-    # 频繁失效并整段重发。默认值与 Gemini 的真实窗口一致，换模型或想收紧时用环境变量覆盖。
     GEMINI_CONTEXT_WINDOW="${GEMINI_CONTEXT_WINDOW:-1048576}"
     GEMINI_MAX_TOKENS="${GEMINI_MAX_TOKENS:-65535}"
+    if ! GEMINI_MODELS_CONFIG=$(GEMINI_MODEL="$GEMINI_MODEL" \
+        GEMINI_CONTEXT_WINDOW="$GEMINI_CONTEXT_WINDOW" GEMINI_MAX_TOKENS="$GEMINI_MAX_TOKENS" \
+        python3 - <<'PYGEMINI'
+import json
+import os
+import re
+import sys
+
+values = [os.environ[key] for key in ("GEMINI_CONTEXT_WINDOW", "GEMINI_MAX_TOKENS")]
+if any(not re.fullmatch(r"[0-9]{1,16}", value) for value in values):
+    sys.exit(1)
+window, tokens = map(int, values)
+if not 0 < tokens <= window <= 9007199254740991:
+    sys.exit(1)
+print(json.dumps([{"id": os.environ["GEMINI_MODEL"], "name": "Gemini-compatible model",
+                   "reasoning": True, "input": ["text", "image"],
+                   "contextWindow": window, "maxTokens": tokens}], separators=(",", ":")))
+PYGEMINI
+    ); then
+        echo "GEMINI_CONTEXT_WINDOW / GEMINI_MAX_TOKENS 必须为正整数，且输出上限不能超过上下文窗口。" >&2
+        exit 1
+    fi
     oc_set 'Gemini 本地适配器' models.providers."$GEMINI_PROVIDER".baseUrl \
         "http://127.0.0.1:${GEMINI_ADAPTER_PORT:-18790}/v1"
     oc_set 'Gemini 本地适配器' models.providers."$GEMINI_PROVIDER".api "openai-completions"
     oc_set 'Gemini 本地适配器' models.providers."$GEMINI_PROVIDER".apiKey "local-adapter"
     oc_set 'Gemini 本地适配器' models.providers."$GEMINI_PROVIDER".models \
-        "[{\"id\":\"$GEMINI_MODEL\",\"name\":\"Gemini-compatible model\",\"reasoning\":true,\"input\":[\"text\",\"image\"],\"contextWindow\":$GEMINI_CONTEXT_WINDOW,\"maxTokens\":$GEMINI_MAX_TOKENS}]" \
+        "$GEMINI_MODELS_CONFIG" \
         --json
     oc_set 'Gemini 本地适配器' models.providers."$GEMINI_PROVIDER".timeoutSeconds 600 --json
     oc_set 'Gemini 本地适配器' models.providers."$GEMINI_PROVIDER".request.allowPrivateNetwork true --json

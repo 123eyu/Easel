@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import shlex
 import sys
 import textwrap
 from pathlib import Path
@@ -118,6 +119,29 @@ def test_context_budget_is_read_only_and_hides_credentials(config):
     assert "sk-private" not in "\n".join(lines)
 
 
+def test_context_cap_and_disabled_compaction_are_not_reported_as_active_threshold(config):
+    config.write_text(json.dumps({"agents": {"defaults": {
+        "contextTokens": 32000, "compaction": {"enabled": False},
+    }}, "models": {"providers": {"custom": {"models": [
+        {"id": "model", "contextWindow": 128000},
+    ]}}}}), encoding="utf-8")
+    output = "\n".join(doctor._context_budget_policy())
+    assert "显式关闭" in output and "参考" in output
+    assert "contextTokens 上限 32,000" in output
+    assert "24,000" in output
+
+
+def test_invalid_skill_budgets_are_not_reported_as_usable(config):
+    config.write_text(json.dumps({"skills": {"limits": {
+        "maxSkillsPromptChars": -1, "maxSkillsInPrompt": True,
+    }}}), encoding="utf-8")
+    assert "格式异常" in "\n".join(doctor._context_budget_policy())
+
+
+def test_large_context_window_uses_integer_math():
+    assert doctor._compaction_threshold(10 ** 309) == 10 ** 309 - 20000
+
+
 # ── ② setup.sh：Gemini 分支的 contextWindow / maxTokens 可覆盖 ──────
 
 def _gemini_models_written(tmp_path: Path, **env: str) -> str:
@@ -134,13 +158,14 @@ def _gemini_models_written(tmp_path: Path, **env: str) -> str:
     calls = tmp_path / "oc.log"
     script = textwrap.dedent(f"""
         set -u
-        PROJECT_ROOT={tmp_path}
-        CFG={calls}
+        PROJECT_ROOT={shlex.quote(tmp_path.as_posix())}
+        CFG={shlex.quote(calls.as_posix())}
         : > "$CFG"
         STANDARD_LLM_CONFIGURED=false
         ok()   {{ echo "OK|$*"; }}
         warn() {{ echo "WARN|$*"; }}
         info() {{ echo "[easel] $*"; }}
+        python3() {{ {shlex.quote(Path(sys.executable).as_posix())} "$@"; }}
         usable_key() {{ [ -n "${{1:-}}" ]; }}
         oc_set()       {{ shift; echo "$1 = $2" >> "$CFG"; }}
         oc_try()       {{ echo "$1 = $2" >> "$CFG"; return 0; }}
@@ -149,7 +174,7 @@ def _gemini_models_written(tmp_path: Path, **env: str) -> str:
         warn_collect() {{ echo "WARN|$1：$2"; }}
     """) + "\n" + branch + "\n"
     proc = subprocess.run(["bash", "-c", script], capture_output=True, text=True,
-                          timeout=60, env={"PATH": os.environ["PATH"], **env})
+                          timeout=60, env={**os.environ, **env})
     assert proc.returncode == 0, f"Gemini 分支执行失败：{proc.stderr}"
     for line in calls.read_text(encoding="utf-8").splitlines():
         if line.startswith("models.providers.rednote-gemini.models = "):
@@ -179,3 +204,23 @@ def test_gemini_models_respect_env_overrides(tmp_path: Path) -> None:
     )
     assert '"contextWindow":128000' in raw
     assert '"maxTokens":16384' in raw
+
+
+@needs_bash
+@pytest.mark.parametrize("window,tokens", [("0", "1"), ("128000", "0"),
+    ("small", "100"), ("100", "101"), ("100,\"extra\":1", "50")])
+def test_gemini_invalid_budget_rejected_before_models_are_written(tmp_path, window, tokens):
+    with pytest.raises(AssertionError, match="Gemini 分支执行失败"):
+        _gemini_models_written(tmp_path, GEMINI_MAAS_API_KEY="fixture-key",
+            GEMINI_MAAS_ENDPOINT="https://example.invalid/v1",
+            GEMINI_CONTEXT_WINDOW=window, GEMINI_MAX_TOKENS=tokens)
+    assert (tmp_path / "oc.log").read_text(encoding="utf-8") == ""
+
+
+@needs_bash
+def test_gemini_model_id_and_paths_are_json_escaped(tmp_path):
+    directory = tmp_path / "space in directory"
+    directory.mkdir()
+    raw = _gemini_models_written(directory, GEMINI_MAAS_API_KEY="fixture-key",
+        GEMINI_MAAS_ENDPOINT="https://example.invalid/v1", GEMINI_MAAS_MODEL='custom/"quoted"')
+    assert json.loads(raw)[0]["id"] == 'custom/"quoted"'
