@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import html
 import os
 import re
 import shutil
@@ -362,6 +363,125 @@ def _compaction_threshold(context_window: int) -> int:
     return context_window - reserve
 
 
+_SKILLS_BUDGET_DEFAULTS = {"maxSkillsInPrompt": 200, "maxSkillsPromptChars": 80_000}
+_SKILLS_BUDGET_ENV = {
+    "maxSkillsInPrompt": "EASEL_MAX_SKILLS_IN_PROMPT",
+    "maxSkillsPromptChars": "EASEL_MAX_SKILLS_PROMPT_CHARS",
+}
+_OPENCLAW_SKILLS_DEFAULTS = {"maxSkillsInPrompt": 150, "maxSkillsPromptChars": 18_000}
+
+
+def _builtin_skills_estimate(cfg: dict) -> tuple[int, int]:
+    """源码目录的保守 UTF-16 字符估算，不查询网关或判断运行时资格。"""
+    from easel.openclaw_workspace import config_path
+
+    agents = cfg.get("agents")
+    agents = agents if isinstance(agents, dict) else {}
+    defaults = agents.get("defaults")
+    defaults = defaults if isinstance(defaults, dict) else {}
+    workspace = defaults.get("workspace")
+    listed = agents.get("list")
+    entries = agents.get("entries")
+    overrides = listed if isinstance(listed, list) else []
+    if isinstance(entries, dict) and isinstance(entries.get("main"), dict):
+        overrides = [*overrides, {**entries["main"], "id": "main"}]
+    for agent in overrides:
+        if isinstance(agent, dict) and agent.get("id") == "main" and agent.get("workspace"):
+            workspace = agent["workspace"]
+    workspace = os.environ.get("EASEL_OPENCLAW_WORKSPACE") or workspace
+    directory = Path(workspace).expanduser() if isinstance(workspace, str) and workspace else config_path().parent / "workspace"
+    paths = sorted((PROJECT_ROOT / "skills" / "builtin").glob("*/SKILL.md"))
+    chars = 1024 if paths else 0
+    for path in paths:
+        source = path.read_text(encoding="utf-8-sig").split("---", 2)
+        if len(source) != 3 or source[0].strip():
+            raise ValueError("invalid skill frontmatter")
+        name = re.search(r"^name:\s*(.+)$", source[1], re.MULTILINE)
+        if name is None or not re.search(r"^description:", source[1], re.MULTILINE):
+            raise ValueError("missing skill metadata")
+        location = str(directory / "skills" / path.parent.name / "SKILL.md")
+        metadata = source[1] + name.group(1) + location
+        chars += len(html.escape(metadata).encode("utf-16-le")) // 2 + 180
+    return len(paths), chars
+
+
+def _skills_budget_updates(cfg: dict, environment=None) -> dict[str, int]:
+    """安装计划：只补缺失叶子键；显式环境覆盖除外，不直接写配置。"""
+    if not isinstance(cfg, dict):
+        raise ValueError("invalid config")
+    skills = cfg.get("skills", {})
+    if not isinstance(skills, dict):
+        raise ValueError("invalid skills config")
+    limits = skills.get("limits", {})
+    if not isinstance(limits, dict):
+        raise ValueError("invalid skills limits")
+    if any("$include" in node for node in (cfg, skills, limits)):
+        raise ValueError("unresolved skills config include")
+    environment = os.environ if environment is None else environment
+    count, chars = _builtin_skills_estimate(cfg)
+    defaults = {
+        "maxSkillsInPrompt": max(_SKILLS_BUDGET_DEFAULTS["maxSkillsInPrompt"], count),
+        "maxSkillsPromptChars": max(_SKILLS_BUDGET_DEFAULTS["maxSkillsPromptChars"], chars + 8192),
+    }
+    updates = {}
+    for key, variable in _SKILLS_BUDGET_ENV.items():
+        raw = environment.get(variable, "")
+        if raw:
+            if not re.fullmatch(r"[0-9]+", raw) or len(raw) > 16 or int(raw) > 2**53 - 1:
+                raise ValueError(f"invalid {variable}")
+            updates[key] = int(raw)
+        elif key not in limits:
+            updates[key] = defaults[key]
+    return updates
+
+
+def _skills_catalog_policy(cfg: dict) -> list[str]:
+    skills = cfg.get("skills")
+    limits = skills.get("limits") if isinstance(skills, dict) else None
+    lines = []
+    if not isinstance(limits, dict):
+        lines.append("skills.limits：未设置（技能目录预算走 OpenClaw 默认值）")
+        limits = {}
+    else:
+        described = []
+        for key in _SKILLS_BUDGET_DEFAULTS:
+            value = limits.get(key)
+            if key not in limits:
+                described.append(f"{key} 未设置")
+            elif type(value) is int and value >= 0:
+                described.append(f"{key}={value:,}" + ("（显式为 0）" if value == 0 else ""))
+            else:
+                described.append(f"{key} 格式异常")
+        lines.append("skills.limits：已设置 " + "，".join(described))
+    try:
+        count, chars = _builtin_skills_estimate(cfg)
+    except (OSError, ValueError):
+        count, chars = 0, 0
+    if count:
+        lines.append(f"内置技能目录离线上界估算：{count} 个，完整描述及路径约 {chars:,} UTF-16 字符；"
+                     "不含第三方技能，未检查运行时资格或实际提示")
+        effective = {key: limits.get(key, default) for key, default in _OPENCLAW_SKILLS_DEFAULTS.items()}
+        if all(type(value) is int and value >= 0 for value in effective.values()):
+            if effective["maxSkillsInPrompt"] < count or effective["maxSkillsPromptChars"] < chars:
+                lines.append("目录预算低于离线估算：存在描述精简或目录截断风险；实际遗漏不能由此推定")
+            else:
+                lines.append("目录预算覆盖此离线估算，但不保证运行时技能或描述全部可见")
+    else:
+        lines.append("内置技能目录离线估算未知：源码缺失或元数据不可读")
+    agents = cfg.get("agents")
+    if isinstance(agents, dict):
+        listed = agents.get("list")
+        entries = agents.get("entries")
+        overrides = listed if isinstance(listed, list) else []
+        if isinstance(entries, dict):
+            overrides = [*overrides, *[value for value in entries.values() if isinstance(value, dict)]]
+        if any(isinstance(agent, dict) and ("skillsLimits" in agent or "skills" in agent) for agent in overrides):
+            lines.append("存在 Agent 级 skillsLimits/skills 覆盖：全局预算不能代表该 Agent 的最终目录")
+    lines.append("运行时可见性未知：使用 openclaw --profile easel skills list --json / skills check，"
+                 "并核对当前会话的实际提示快照与截断警告；清单 Eligible 数不等于提示内可见数")
+    return lines
+
+
 def _context_budget_policy() -> list[str]:
     """描述已保存的上下文预算配置；不改配置，也不假设运行时已加载。"""
     try:
@@ -406,23 +526,7 @@ def _context_budget_policy() -> list[str]:
                 lines.append(f"{provider}/{model_id}：声明 {window:,}{cap_note} → "
                              f"默认参数参考压缩阈值约 {_compaction_threshold(effective):,}")
 
-    skills = cfg.get("skills")
-    limits = skills.get("limits") if isinstance(skills, dict) else None
-    if not isinstance(limits, dict):
-        lines.append("skills.limits：未设置（技能目录预算走 OpenClaw 默认值）")
-    else:
-        chars = limits.get("maxSkillsPromptChars")
-        count = limits.get("maxSkillsInPrompt")
-        described = []
-        if type(chars) is int and chars > 0:
-            described.append(f"maxSkillsPromptChars={chars:,}")
-        elif chars is not None:
-            described.append("maxSkillsPromptChars 格式异常")
-        if type(count) is int and count > 0:
-            described.append(f"maxSkillsInPrompt={count}")
-        elif count is not None:
-            described.append("maxSkillsInPrompt 格式异常")
-        lines.append("skills.limits：已设置 " + ("，".join(described) if described else "（无可识别字段）"))
+    lines.extend(_skills_catalog_policy(cfg))
     return lines
 
 

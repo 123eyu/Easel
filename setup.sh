@@ -257,6 +257,36 @@ run_step() {   # $1 label  其余为命令
     "$@"
 }
 
+oc_configure_skills_budget() {
+    local plan key value
+    if ! plan="$(python3 - "$PROJECT_ROOT" <<'PY'
+import json, sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+from easel.commands.doctor import _openclaw_config_path, _skills_budget_updates
+from easel.direct_api import read_settings
+try:
+    path = _openclaw_config_path()
+    config = json.loads(path.read_text(encoding="utf-8-sig")) if path.exists() else {}
+    environment = read_settings(Path(sys.argv[1]) / ".env")
+    updates = _skills_budget_updates(config, environment)
+except (OSError, ValueError):
+    sys.exit(1)
+for key, value in updates.items():
+    print(f"skills.limits.{key}={value}")
+PY
+)"; then
+        warn_collect '技能目录预算' '配置或环境覆盖不可解析；保留现状，不盲写' 'easel doctor'
+        return 0
+    fi
+    while IFS='=' read -r key value; do
+        [ -n "$key" ] || continue
+        if ! oc_try "$key" "$value" --json; then
+            warn_collect '技能目录预算' "当前 OpenClaw 不接受 $key；保留该项现状（可能版本不支持）" 'easel doctor'
+        fi
+    done <<< "$plan"
+}
+
 # ---- 安装报告 ----
 # 把本次安装的遗留问题落盘，供 `easel doctor` 复述。这样「装完还差什么」不依赖用户
 # 记住十几分钟前滚过去的终端输出。
@@ -712,6 +742,7 @@ if [ "$SYNC_RC" -ne 0 ]; then
     warn_collect '技能同步' "agents/sync.sh 退出码 $SYNC_RC；技能可能没进 agent 实际读取的 workspace" \
         'bash agents/sync.sh' high
 fi
+oc_configure_skills_budget
 
 # ---- 9. 认证信息写入 Easel 专属 OpenClaw config ----
 info "同步认证到 OpenClaw profile..."
